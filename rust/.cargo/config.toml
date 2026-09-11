@@ -1,0 +1,14 @@
+# Point pyo3's build script at the project's uv-managed virtualenv.
+#
+# Left to itself pyo3 takes the first `python3` on PATH, which may not satisfy the
+# `abi3-py311` floor or may not exist at all in a bare shell. `relative = true`
+# resolves the path against this file's directory, so it works in any checkout
+# rather than hard-coding one machine's layout. `uv sync` (the documented setup step
+# in DEVELOPING.md) creates that venv.
+#
+# Safe for maturin: cargo's `[env]` does not override a variable already present in
+# the environment -- that would need `force = true` -- and maturin always sets its
+# own `PYO3_PYTHON`. So `inv build` keeps using the interpreter maturin picked, and
+# this only fills the gap when nothing else has chosen one.
+[env]
+PYO3_PYTHON = { value = "../.venv/bin/python", relative = true }

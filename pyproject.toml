@@ -1,0 +1,129 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "trustedlicenses"
+version = "0.1.0"
+description = "Policy-driven license auditing for installed Python dependencies, using text-based detection instead of self-reported metadata."
+keywords = ["license", "compliance", "license-check", "spdx", "dependencies", "audit"]
+readme = "README.md"
+authors = [
+    { name = "William Martin" }
+]
+license = "MIT"
+requires-python = ">=3.11"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Quality Assurance",
+]
+dependencies = [
+    "typer>=0.27.2",
+    "tomlkit>=0.15.1",
+]
+
+[project.urls]
+Homepage = "https://github.com/w-martin/trustedlicenses"
+Repository = "https://github.com/w-martin/trustedlicenses"
+"Issue Tracker" = "https://github.com/w-martin/trustedlicenses/issues"
+
+[project.scripts]
+trustedlicenses = "trustedlicenses.cli:app"
+
+[tool.maturin]
+manifest-path = "rust/Cargo.toml"
+python-source = "src"
+module-name = "trustedlicenses.rust_matcher"
+features = ["pyo3/extension-module"]
+
+[tool.pytest.ini_options]
+addopts = "--cov=src --cov-report=term-missing --cov-branch"
+testpaths = ["tests"]
+
+[tool.coverage.run]
+branch = true
+omit = ["tests/*", "tasks.py"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+fix = true
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+    "D203",     # Conflicts with D211
+    "D212",     # Conflicts with D213
+    "COM812",   # Conflicts with ruff formatter
+    "CPY001",   # Project does not use copyright header notices
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101", "SLF001"]
+# Verbatim canonical license text used as a test fixture (sourced from the `spdx`
+# crate's own bundled SPDX corpus) -- FSF's GPL-2.0 paragraphs run well past 120
+# columns; rewrapping them would mean the fixture is no longer the actual text.
+"tests/conftest.py" = ["E501"]
+# FBT001/FBT003: Typer's own API puts a bare bool default (e.g. `typer.Option(False,
+# "--quiet", ...)`) in the option's own positional signature -- that's the documented
+# way to declare a Typer flag, not something to route around.
+"src/trustedlicenses/cli.py" = ["FBT001", "FBT003"]
+"tasks.py" = ["T201"]
+
+[tool.ruff.lint.flake8-bugbear]
+# B008 normally flags a function call in an argument default (it usually means a
+# mutable default evaluated once at import time) -- but `typer.Option(...)` /
+# `typer.Argument(...)` calls in a parameter default are Typer's own documented way
+# to declare CLI options/arguments, and are safe (immutable per-call) by design.
+extend-immutable-calls = ["typer.Option", "typer.Argument"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ty.terminal]
+output-format = "concise"
+
+[tool.pyrefly]
+# Without this, pyrefly infers its import root as `src/` only and can't resolve
+# `tests/*.py`'s `from tests.conftest import ...` (tests/ has its own `__init__.py`,
+# so it's a real package rooted at the repo root, not just `src/`).
+search-path = [".", "src"]
+
+[dependency-groups]
+docs = [
+    "mkdocs-material>=9.7.7",
+    "mkdocstrings-python>=2.0.5",
+]
+dev = [
+    "invoke>=2.2.1",
+    "maturin>=1.14.1",
+    "pytest>=9.1.1",
+    "pytest-cov>=7.1.0",
+    "pyrefly>=1.2.0",
+    "ruff>=0.16.3",
+    "ty>=0.0.72",
+]
+
+[tool.trustedlicenses]
+allowed-categories = ["Permissive", "Public Domain", "Copyleft Limited"]

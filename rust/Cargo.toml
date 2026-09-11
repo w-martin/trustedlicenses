@@ -1,0 +1,38 @@
+[package]
+name = "trustedlicenses_matcher"
+version = "0.1.0"
+edition = "2021"
+description = "Rust license-text matcher for trustedlicenses, wrapping the spdx crate's SPDX-corpus text detection"
+license = "MIT"
+repository = "https://github.com/w-martin/trustedlicenses"
+homepage = "https://github.com/w-martin/trustedlicenses"
+documentation = "https://github.com/w-martin/trustedlicenses"
+
+[lib]
+name = "rust_matcher"
+crate-type = ["cdylib", "rlib"]
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+unwrap_used = "warn"
+
+[dependencies]
+# `detection`: word-bigram Sorensen-Dice text matching against the SPDX license-list-data
+# corpus (a maintained inlining of askalono's algorithm -- askalono itself is
+# unmaintained). `detection-inline-cache` bakes the compiled corpus into this binary, so
+# there's no runtime data file to locate or load.
+spdx = { version = "0.13", default-features = false, features = ["detection", "detection-inline-cache"] }
+# `extension-module` is deliberately NOT enabled here -- see typedframes/rust/Cargo.toml
+# for why (maturin turns it on only for the builds that need it; forcing it on breaks
+# `cargo test`/`cargo clippy` on macOS by leaving pyo3's linked-libpython symbols
+# unresolved).
+pyo3 = { version = "0.29", features = ["abi3-py311"] }

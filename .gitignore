@@ -1,0 +1,25 @@
+# Rust
+/target
+**/target
+*.rs.bk
+*.so
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.coverage
+coverage.lcov
+htmlcov/
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+
+# Docs
+site/
+
+# OS / editor
+.idea/
+.DS_Store

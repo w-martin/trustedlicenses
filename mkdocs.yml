@@ -1,0 +1,41 @@
+site_name: trustedlicenses
+site_description: Policy-driven license auditing for installed Python dependencies.
+docs_dir: docs
+
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          paths: [src]
+          options:
+            docstring_style: google
+            show_root_heading: true
+            show_category_heading: true
+            merge_init_into_class: true
+
+nav:
+  - Home: index.md
+  - Usage Guide: usage.md
+  - Comparison to Alternatives: comparison.md
+  - API Reference:
+    - Overview: api/index.md
+    - Detection: api/detection.md
+    - Policy: api/policy.md
+    - Config: api/config.md
+    - Resolve: api/resolve.md
+    - CLI: api/cli.md

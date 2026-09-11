@@ -1,0 +1,45 @@
+trustedlicenses is licensed under the MIT License (see LICENSE). It bundles or
+depends on the following third-party data and code, under their own terms:
+
+## SPDX License List data
+
+The `spdx` Rust crate this project depends on embeds the official SPDX License List
+(https://github.com/spdx/license-list-data, generated from
+https://github.com/spdx/license-list-XML), used here as the reference corpus for
+license-text matching.
+
+Copyright (c) The Linux Foundation and its Contributors. Licensed under the Creative
+Commons Attribution License 3.0 Unported (CC-BY-3.0):
+https://creativecommons.org/licenses/by/3.0/legalcode
+
+(The license-list-data and license-list-XML repositories carry no standalone LICENSE
+file of their own; this notice follows the license terms stated for the SPDX
+Specification itself, of which the License List is stated to be "an integral part" --
+the most authoritative source found for these terms.)
+
+## The `spdx` Rust crate
+
+https://github.com/EmbarkStudios/spdx -- provides the text-detection engine this
+project's Rust matcher wraps (`rust/src/matcher.rs`), itself a maintained continuation
+of askalono's (Copyright Amazon.com, Inc. or its affiliates) word-bigram
+Sorensen-Dice matching algorithm.
+
+Copyright the `spdx` contributors. Licensed under the Apache License, Version 2.0:
+http://www.apache.org/licenses/LICENSE-2.0
+
+## ScanCode Toolkit license category data
+
+The SPDX-license-identifier -> category mapping bundled at
+`src/trustedlicenses/data/spdx_license_categories.json` (used to classify a detected
+license as e.g. "Permissive" or "Copyleft") was extracted from ScanCode Toolkit's
+license database (https://github.com/aboutcode-org/scancode-toolkit,
+`licensedcode/data/licenses/`).
+
+Per that data's own `scancode-data.ABOUT` file:
+
+    Copyright (c) nexB Inc. and others. All rights reserved.
+    ScanCode is a trademark of nexB Inc.
+    SPDX-License-Identifier: CC-BY-4.0
+    See https://creativecommons.org/licenses/by/4.0/legalcode for the license text.
+    See https://github.com/nexB/scancode-toolkit for support or download.
+    See https://aboutcode.org for more information about nexB OSS projects.
