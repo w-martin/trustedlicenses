@@ -1,7 +1,7 @@
 # trustedlicenses
 
 `trustedlicenses` checks that every package installed in your Python project has a
-license you've actually agreed to allow — and fails your CI build if one doesn't.
+license you've agreed to allow, so you can gate a CI build on it.
 
 ```toml
 # pyproject.toml

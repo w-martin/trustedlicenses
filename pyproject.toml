@@ -4,8 +4,8 @@ build-backend = "maturin"
 
 [project]
 name = "trustedlicenses"
-version = "0.1.0"
-description = "Policy-driven license auditing for installed Python dependencies, using text-based detection instead of self-reported metadata."
+version = "0.1.1"
+description = "Policy-driven license auditing for installed Python dependencies, preferring declared package metadata and falling back to license-text matching."
 keywords = ["license", "compliance", "license-check", "spdx", "dependencies", "audit"]
 readme = "README.md"
 authors = [
@@ -43,6 +43,16 @@ manifest-path = "rust/Cargo.toml"
 python-source = "src"
 module-name = "trustedlicenses.rust_matcher"
 features = ["pyo3/extension-module"]
+# The wheel auto-bundles LICENSE/NOTICE (both live at the repo root, outside the
+# rust/ crate dir maturin's sdist packaging otherwise looks at) -- but its sdist
+# doesn't, a known maturin gap for this layout. PKG-INFO still claims them as
+# License-File entries either way, so an sdist missing them is a real PyPI upload
+# rejection (400: "License-File LICENSE does not exist in distribution file"),
+# not just a cosmetic omission.
+include = [
+    { path = "LICENSE", format = "sdist" },
+    { path = "NOTICE", format = "sdist" },
+]
 
 [tool.pytest.ini_options]
 addopts = "--cov=src --cov-report=term-missing --cov-branch"

@@ -1,16 +1,24 @@
 # trustedlicenses
 
 [![CI](https://github.com/w-martin/trustedlicenses/actions/workflows/ci.yml/badge.svg)](https://github.com/w-martin/trustedlicenses/actions/workflows/ci.yml)
+[![PyPI version](https://img.shields.io/pypi/v/trustedlicenses.svg)](https://pypi.org/project/trustedlicenses/)
+[![Python versions](https://img.shields.io/pypi/pyversions/trustedlicenses.svg)](https://pypi.org/project/trustedlicenses/)
 [![Documentation](https://readthedocs.org/projects/trustedlicenses/badge/?version=latest)](https://trustedlicenses.readthedocs.io/en/latest/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-> ⚠️ **Project status: early scaffold.** The API and config format are not yet
-> stable.
+> ⚠️ **Project Status: Experimental**
+>
+> `trustedlicenses` (v0.1.1) is an early, experimental release. Detection, policy
+> evaluation, and the CLI work end-to-end with full test coverage, but the API and
+> config format aren't stable yet, and license detection — declared-metadata parsing
+> and the Rust text-matching fallback alike — can be wrong. See the
+> [legal disclaimer](#legal-disclaimer) before relying on this for a real compliance
+> decision.
 
 **`trustedlicenses` checks that every package installed in your Python project has a
-license you've actually agreed to allow — and fails your CI build if one doesn't.**
-Point it at your environment, tell it which kinds of license are acceptable, and it
-tells you which packages don't comply and why.
+license you've agreed to allow, so you can gate a CI build on it.** Point it at your
+environment, tell it which kinds of license are acceptable, and it tells you which
+packages don't comply and why.
 
 ## Quick look
 
@@ -229,4 +237,4 @@ See also: [en.wikipedia.org/wiki/IANAL](https://en.wikipedia.org/wiki/IANAL).
 
 ## Status
 
-Early scaffold — API and config format are not yet stable.
+Experimental — API and config format are not yet stable.
