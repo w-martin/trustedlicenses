@@ -7,12 +7,11 @@ project. The same detection can pass one project's policy and fail another's.
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from importlib.metadata import distributions
 from typing import TYPE_CHECKING
 
-from trustedlicenses.detection import DistributionLicence, canonical_name, categories_for, inspect_distribution
+from trustedlicenses.detection import DistributionLicence, canonical_name, categories_for, inspect_distributions
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -180,14 +179,8 @@ def detect_all(
             continue
         to_inspect[name] = dist
 
-    # Most packages resolve from declared metadata (microseconds); the minority that
-    # fall back to the Rust text matcher can each take tens to hundreds of milliseconds
-    # (see `trustedlicenses.rust_matcher.scan_license_text`'s docstring) -- a thread
-    # pool actually parallelizes that work, since the matcher releases the GIL for the
-    # scan itself, rather than running every package's detection strictly one at a time.
-    with ThreadPoolExecutor() as executor:
-        results = executor.map(lambda item: inspect_distribution(item[1], name=item[0]), to_inspect.items())
-    return tuple(sorted(results, key=lambda result: result.name))
+    results = inspect_distributions(to_inspect)
+    return tuple(sorted(results.values(), key=lambda result: result.name))
 
 
 def evaluate(policy: Policy, distributions_: Iterable[Distribution] | None = None) -> PolicyResult:

@@ -31,6 +31,9 @@ unwrap_used = "warn"
 # unmaintained). `detection-inline-cache` bakes the compiled corpus into this binary, so
 # there's no runtime data file to locate or load.
 spdx = { version = "0.13", default-features = false, features = ["detection", "detection-inline-cache"] }
+# Parallelizes the batched scan in `scan_license_texts` across CPU cores -- see
+# `matcher.rs` for why that's a real (not dev-only) dependency.
+rayon = "1"
 # `extension-module` is deliberately NOT enabled here -- see typedframes/rust/Cargo.toml
 # for why (maturin turns it on only for the builds that need it; forcing it on breaks
 # `cargo test`/`cargo clippy` on macOS by leaving pyo3's linked-libpython symbols
