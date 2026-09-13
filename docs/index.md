@@ -35,8 +35,9 @@ bundles in its `.dist-info` directory against the official SPDX
 Rust matcher. No system dependencies, no network calls, no rule-engine to install.
 
 See [Comparison to Alternatives](comparison.md) for how this stacks up against
-`pip-licenses`, `licensecheck`, `liccheck`, and ScanCode Toolkit-based tools —
-including measured speed and known failure modes of each.
+`pip-licenses`, `licensecheck`, `liccheck`, and ScanCode Toolkit-based tools, and
+[Performance](performance.md) for measured speed on a 425-package real-world
+environment.
 
 ## Installation
 

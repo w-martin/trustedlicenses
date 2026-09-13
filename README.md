@@ -122,7 +122,7 @@ i 1 compatibility note(s) -- not a pass/fail result, see below:
 ```
 
 This is deliberately narrow and never affects pass/fail — see
-[Comparison to Alternatives § compatibility notes](https://trustedlicenses.readthedocs.io/en/latest/comparison/#a-narrow-fsf-grounded-compatibility-check)
+[Usage Guide § compatibility notes](https://trustedlicenses.readthedocs.io/en/latest/usage/#a-narrow-fsf-grounded-compatibility-check)
 for exactly what it does and doesn't check, and why.
 
 Then run:
@@ -215,9 +215,33 @@ install, no network calls, and it doesn't need special system libraries the way 
 older tools in this space do.
 
 See **[Comparison to Alternatives](https://trustedlicenses.readthedocs.io/en/latest/comparison/)**
-for the deeper technical dive — how this differs from `pip-licenses`, `licensecheck`,
-`liccheck`, and ScanCode Toolkit, a reproducible speed benchmark, and a real
-false-negative we found and fixed in our own matcher along the way.
+for how this differs from `pip-licenses`, `licensecheck`, `liccheck`, and ScanCode
+Toolkit in practice.
+
+## Speed
+
+On a 425-package real-world environment (data science + web + cloud + ML stack, full
+transitive dependency trees — see [Performance](https://trustedlicenses.readthedocs.io/en/latest/performance/)
+for exactly what's in it), `trustedlicenses` comes out fastest of the tools tested,
+despite doing genuine text-matching work for the ~23% of packages with no usable
+declared metadata:
+
+| Tool | Median | Range |
+|---|---|---|
+| **`trustedlicenses`** | **1.29s** | 1.25s – 2.05s |
+| `pip-licenses` | 1.60s | 1.56s – 2.58s |
+| `licensecheck` | 2.13s | 2.08s – 9.30s |
+| `liccheck` | — | crashes on a current Python/setuptools combination |
+
+That speed isn't free or automatic: without releasing Python's GIL during each Rust
+text-matching scan and without running scans in parallel, the same fallback work
+takes **7.7–8.9s** on this same environment — roughly 6x slower. Instead, the
+fallback scans run concurrently across a thread pool, and the underlying Rust
+matcher releases the GIL for the duration of each scan, so independent per-package
+work actually runs on multiple cores rather than serializing behind Python's
+interpreter lock. See
+[Performance](https://trustedlicenses.readthedocs.io/en/latest/performance/) for the
+full breakdown, methodology, and why `liccheck` couldn't be measured at all.
 
 ## Legal disclaimer
 
@@ -227,8 +251,8 @@ package passes your configured policy — is a best-effort technical signal, not
 legal opinion. It can be wrong: a package's declared metadata can be inaccurate or
 absent, and the text-matching fallback is a similarity match with a real, disclosed
 false-negative/false-positive tradeoff (see
-[Comparison to Alternatives](https://trustedlicenses.readthedocs.io/en/latest/comparison/#a-real-limitation-we-found-in-our-own-tool)
-for a concrete case we found and fixed). Do not rely on `trustedlicenses`'s output as
+[Usage Guide § confidence threshold](https://trustedlicenses.readthedocs.io/en/latest/usage/#a-note-on-the-text-matching-fallbacks-confidence-threshold)
+for a concrete case where this matters). Do not rely on `trustedlicenses`'s output as
 a substitute for review by a qualified professional before making a legal or license-
 compliance decision. Use of this software is entirely at your own risk — see
 [LICENSE](LICENSE) for the full disclaimer of warranty.

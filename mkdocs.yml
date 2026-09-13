@@ -32,6 +32,7 @@ nav:
   - Home: index.md
   - Usage Guide: usage.md
   - Comparison to Alternatives: comparison.md
+  - Performance: performance.md
   - API Reference:
     - Overview: api/index.md
     - Detection: api/detection.md

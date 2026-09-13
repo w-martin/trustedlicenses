@@ -36,3 +36,10 @@ spdx = { version = "0.13", default-features = false, features = ["detection", "d
 # `cargo test`/`cargo clippy` on macOS by leaving pyo3's linked-libpython symbols
 # unresolved).
 pyo3 = { version = "0.29", features = ["abi3-py311"] }
+
+[dev-dependencies]
+# `cargo test` calls `scan_license_text` directly (not through an embedding Python
+# process), so it needs a real interpreter to `Python::attach` to. Dev-only: this
+# doesn't affect the actual extension-module wheel build, which never links its own
+# interpreter -- it runs inside the Python process that imported it.
+pyo3 = { version = "0.29", features = ["auto-initialize"] }

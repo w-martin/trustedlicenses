@@ -50,12 +50,48 @@ If both exist, the standalone file wins.
   you've manually verified are fine despite failing automated detection (e.g. a
   package with a `LicenseRef-` custom license your legal team has already reviewed).
 
+### A narrow, FSF-grounded compatibility check
+
 If your project's own `[project.license]` is declared (per
 [PEP 639](https://peps.python.org/pep-0639/)), a small set of narrow, FSF-documented
-copyleft compatibility notes are also checked — see [Comparison to Alternatives §
-A narrow, FSF-grounded compatibility check](comparison.md#a-narrow-fsf-grounded-compatibility-check)
-for exactly what's checked and why it's deliberately limited. These are informational
-only and never affect pass/fail.
+copyleft compatibility notes are also checked, printed separately from pass/fail
+results and never affecting them.
+
+`trustedlicenses` does not implement general project-vs-dependency compatibility
+checking. `licensecheck` is the one tool in this space that ships that feature, and
+it doesn't use categories at all — per its source (`license_matrix/__init__.py`,
+`matrix.csv`), it's a hand-rolled pairwise matrix over **27 granular license
+variants** (`GPL_2`, `GPL_2_PLUS`, `GPL_3`, `LGPL_2_PLUS`, ...), not 4 buckets. The
+FSF's own [GPL compatibility guidance](https://www.gnu.org/licenses/gpl-faq.html#AllCompatibility)
+states plainly: *"GPLv2 is, by itself, not compatible with GPLv3."* Both are
+"Copyleft" in the category taxonomy this project uses — a category-only check would
+call that pairing fine, and be wrong. MPL-2.0 (bucketed "Copyleft Limited") makes it
+worse: it has an explicit, conditional GPL-compatibility clause written into the
+license text itself, which authors can opt out of — something no simple
+category-boundary check can represent either.
+
+A category-level compatibility verdict risks a confident-sounding wrong answer,
+which is exactly what the [legal disclaimer](https://github.com/w-martin/trustedlicenses#legal-disclaimer)
+warns against. So this check is much narrower than general "compatibility
+checking" — it fires only on the small number of pairings the FSF states explicitly
+and unambiguously, using exact SPDX identifiers rather than categories, and is
+presented as a note to verify, never a verdict:
+
+1. **GPL-2.0-only project + GPL-3.0/AGPL-3.0-family dependency (or vice versa)** — the
+   specific FSF-documented mismatch above. Deliberately excludes `GPL-2.0-or-later`,
+   which grants permission to relicense under GPLv3.
+2. **Non-copyleft project + a plain strong-copyleft dependency** (`GPL-2.0-only`,
+   `GPL-2.0-or-later`, `GPL-3.0-only`, `GPL-3.0-or-later`, `AGPL-3.0-only`,
+   `AGPL-3.0-or-later` — never `LGPL`/`MPL`, which have their own linking/conditional
+   exceptions) — a general "worth a second look" heads-up, not a specific citation.
+
+This requires your own project to declare `[project.license]`; with nothing
+declared, no notes fire at all — a responsible note needs both sides. See
+`_compatibility_note` in
+[`policy.py`](https://github.com/w-martin/trustedlicenses/blob/main/src/trustedlicenses/policy.py)
+for the exact logic, and a real example — a GPL-2.0-only project pulling in `scipy`
+(GPL-3.0-or-later) via `scikit-learn` — in the
+[README](https://github.com/w-martin/trustedlicenses#usage).
 
 ## Step 2 — Run the check
 
@@ -278,15 +314,43 @@ For each installed distribution, in priority order:
 2. **Bundled license file text**, only when nothing declared resolves. Any file
    matching `LICENSE*`, `LICENCE*`, `COPYING*`, or `NOTICE*` in the package's
    `.dist-info` directory is matched against the official SPDX
-   [license-list-data](https://github.com/spdx/license-list-data) corpus, via a Rust
-   matcher wrapping the [`spdx`](https://github.com/EmbarkStudios/spdx) crate's
-   word-bigram Sørensen–Dice text detection (the same algorithm family GitHub's own
-   Licensee uses). A concatenated file — e.g. a package's own permissive grant
-   alongside a vendored dependency's copyleft notice — is segmented, not treated as
-   one blob, so both licenses are reported.
+   [license-list-data](https://github.com/spdx/license-list-data) corpus, via a small
+   Rust matcher wrapping the [`spdx`](https://github.com/EmbarkStudios/spdx) crate's
+   word-bigram Sørensen–Dice text detection.
 
 If neither resolves anything, the package reports `no license information found` and
 fails any policy (an unknown license is never assumed to be safe).
+
+### The text-matching algorithm
+
+This is the same general *family* of approach as GitHub's own
+[Licensee](https://github.com/licensee/licensee) (a wordset+bigram Dice coefficient
+against a curated 47-license corpus from choosealicense.com, at a 98% threshold) and
+[askalono](https://github.com/jpeddicord/askalono) (word-bigram Sørensen–Dice against
+the full SPDX corpus, originally built at Amazon — per its shipped copyright
+headers — now unmaintained). The `spdx` crate `trustedlicenses` depends on inlines
+askalono's algorithm as a maintained continuation of it — see `cargo-deny`'s own
+changelog documenting its migration off raw askalono onto this crate — the same
+reason `cargo-deny`/`cargo-about` depend on it too.
+
+This is deliberately *not* ScanCode Toolkit's approach: a full rule-based engine
+matching against ~2,100 license texts plus ~32,000 notice/variant rules via hash
+matching, an Aho-Corasick-style matcher, and sequence alignment, which is real
+machinery built for scanning arbitrary source trees for embedded license fragments
+— a different, harder problem than auditing one package's own declared license. See
+[Comparison to Alternatives](comparison.md) for how that tradeoff plays out in
+practice, and what it costs to have skipped it.
+
+Worth knowing: a LICENSE file that concatenates several licenses (e.g. a package's
+own permissive grant alongside a vendored dependency's copyleft notice) is
+segmented, not treated as one blob, so both are reported — Licensee's whole-file
+wordset/bigram approach has no equivalent segmentation, per its source, so it would
+silently score such a file below threshold and report no match at all, rather than
+a wrong one. `trustedlicenses` uses the `spdx`/askalono lineage's `TopDown` scan
+mode specifically because it handles this correctly — see the module doc comment in
+[`matcher.rs`](https://github.com/w-martin/trustedlicenses/blob/main/rust/src/matcher.rs)
+for why the alternative `Elimination` scan mode is not used instead (it drops
+matches near the start of a document after a prior elimination pass).
 
 ### Categories
 
@@ -302,10 +366,25 @@ for the required attribution), since that's the same vocabulary most existing
 Text similarity matching is inherently probabilistic — unlike a rule engine (ScanCode)
 or pure metadata reading (`pip-licenses`), there's a tunable confidence threshold a
 match must clear to be reported at all. `trustedlicenses` uses `0.8`, not the `spdx`/
-askalono library's own default of `0.9` — verified directly against real installed
-packages that `0.9` produces false negatives on genuine, unmodified license text (see
-[Comparison to Alternatives](comparison.md#a-real-limitation-we-found-in-our-own-tool)
-for the specific packages and scores that led to this).
+askalono library's own default of `0.9`.
+
+This has a concrete, real-world effect: two extremely common, correctly-licensed
+PyPI packages — [`jupyter`](https://pypi.org/project/jupyter/)'s and
+[`prompt-toolkit`](https://pypi.org/project/prompt-toolkit/)'s genuine, unmodified
+BSD-3-Clause `LICENSE` files — score `0.85` and `0.91` respectively
+against the corpus. At the library's own default of `0.9`, both are missed. At
+`0.8` — which turns out to be what
+[askalono's own CLI actually uses](https://github.com/jpeddicord/askalono),
+overriding its *library's* `0.9` default for evidently the same reason — both
+resolve correctly, without introducing false positives at nearby scores (`0.7`
+starts misidentifying BSD-3-Clause variants as the wrong license). See
+`TEXT_MATCH_CONFIDENCE_THRESHOLD` in
+[`detection.py`](https://github.com/w-martin/trustedlicenses/blob/main/src/trustedlicenses/detection.py).
+
+Any similarity-based text matcher — ours included — has a real, tunable
+false-negative/false-positive tradeoff. It is not a rule engine, and it will not be
+right 100% of the time. See the
+[legal disclaimer](https://github.com/w-martin/trustedlicenses#legal-disclaimer).
 
 ## Development
 

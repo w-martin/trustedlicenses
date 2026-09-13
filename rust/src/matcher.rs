@@ -56,19 +56,35 @@ fn store() -> &'static Store {
 /// grant alongside a vendored dependency's copyleft notice). `spdx_license_id` is the
 /// exact SPDX license-list identifier (e.g. `"MIT"`, `"GPL-2.0-or-later"`), not a
 /// lowercased key.
+///
+/// Releases the GIL for the actual scan (`Python::detach`): `TopDown`'s sliding-window
+/// scan is CPU-bound and can take tens to hundreds of milliseconds for a large or
+/// structurally complex license file (a multi-paragraph document that mixes several
+/// license-like fragments, e.g. a project's own notice explaining a mix of public-domain
+/// and third-party-licensed files, forces many more candidate windows than a single
+/// clean license text) -- verified directly against real installed packages. Without
+/// releasing the GIL here, calling this from multiple Python threads (see
+/// `trustedlicenses.policy.detect_all`, which does exactly that to scan many
+/// independent packages' license files concurrently) would buy no real parallelism.
 #[pyfunction]
 #[pyo3(signature = (text, confidence_threshold = DEFAULT_CONFIDENCE_THRESHOLD))]
-pub(crate) fn scan_license_text(text: &str, confidence_threshold: f32) -> Vec<(String, f32)> {
-    let data = TextData::new(text);
-    let strategy = Scanner::with_scan_mode(store(), ScanMode::top_down())
-        .confidence_threshold(confidence_threshold);
-    let result = strategy.scan(&data);
+pub(crate) fn scan_license_text(
+    py: Python<'_>,
+    text: &str,
+    confidence_threshold: f32,
+) -> Vec<(String, f32)> {
+    py.detach(|| {
+        let data = TextData::new(text);
+        let strategy = Scanner::with_scan_mode(store(), ScanMode::top_down())
+            .confidence_threshold(confidence_threshold);
+        let result = strategy.scan(&data);
 
-    result
-        .containing
-        .into_iter()
-        .map(|contained| (contained.license.name.to_string(), contained.score))
-        .collect()
+        result
+            .containing
+            .into_iter()
+            .map(|contained| (contained.license.name.to_string(), contained.score))
+            .collect()
+    })
 }
 
 #[cfg(test)]
@@ -80,7 +96,7 @@ mod tests {
 
     #[test]
     fn finds_a_single_license() {
-        let matches = scan_license_text(MIT, DEFAULT_CONFIDENCE_THRESHOLD);
+        let matches = Python::attach(|py| scan_license_text(py, MIT, DEFAULT_CONFIDENCE_THRESHOLD));
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].0, "MIT");
         assert!(matches[0].1 > 0.9);
@@ -89,7 +105,8 @@ mod tests {
     #[test]
     fn finds_both_licenses_in_a_concatenated_file() {
         let concatenated = format!("{MIT}\n\n{GPL_2_0}");
-        let matches = scan_license_text(&concatenated, DEFAULT_CONFIDENCE_THRESHOLD);
+        let matches =
+            Python::attach(|py| scan_license_text(py, &concatenated, DEFAULT_CONFIDENCE_THRESHOLD));
         let names: Vec<&str> = matches.iter().map(|(name, _)| name.as_str()).collect();
         assert!(names.contains(&"MIT"), "expected MIT in {names:?}");
         assert!(
@@ -100,10 +117,13 @@ mod tests {
 
     #[test]
     fn finds_nothing_in_unrelated_text() {
-        let matches = scan_license_text(
-            "this is a README, not a license",
-            DEFAULT_CONFIDENCE_THRESHOLD,
-        );
+        let matches = Python::attach(|py| {
+            scan_license_text(
+                py,
+                "this is a README, not a license",
+                DEFAULT_CONFIDENCE_THRESHOLD,
+            )
+        });
         assert!(matches.is_empty());
     }
 }
