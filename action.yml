@@ -1,0 +1,39 @@
+name: trustedlicenses
+description: Check installed Python dependency licenses against your project's allowed-categories policy.
+author: William Martin
+branding:
+  icon: shield
+  color: green
+
+inputs:
+  version:
+    description: >
+      trustedlicenses version to install, as a pip version specifier (e.g. "0.1.1"
+      or ">=0.1,<0.2"). Defaults to the latest release on PyPI.
+    required: false
+    default: ''
+  args:
+    description: Arguments passed to the trustedlicenses CLI.
+    required: false
+    default: '--quiet'
+
+runs:
+  using: composite
+  steps:
+    - name: Install trustedlicenses
+      shell: bash
+      run: |
+        if [ -n "${{ inputs.version }}" ]; then
+          spec="trustedlicenses==${{ inputs.version }}"
+        else
+          spec="trustedlicenses"
+        fi
+        if command -v uv >/dev/null 2>&1; then
+          uv pip install "$spec"
+        else
+          pip install "$spec"
+        fi
+
+    - name: Run trustedlicenses
+      shell: bash
+      run: trustedlicenses ${{ inputs.args }}

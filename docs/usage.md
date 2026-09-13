@@ -221,7 +221,23 @@ Add a policy to start enforcing this (re-run without --quiet in a terminal for g
 default anyway — `trustedlicenses` detects that and falls back to report mode on its
 own — but pass `--quiet` explicitly so that stays true even if a step happens to have
 a terminal attached (e.g. a local pre-commit run), rather than relying on the
-auto-detection alone. A pre-commit hook entry:
+auto-detection alone.
+
+### pre-commit
+
+`trustedlicenses` audits whatever's actually installed in the current Python
+environment, so the hook needs your project's own dependencies already installed —
+not an isolated hook-specific environment the way most pre-commit hooks work. Add
+`trustedlicenses` as a dev dependency, then reference this repo directly:
+
+```yaml
+- repo: https://github.com/w-martin/trustedlicenses
+  rev: v0.1.1
+  hooks:
+    - id: trustedlicenses
+```
+
+Or write the same thing as a local hook without depending on this repo's tag:
 
 ```yaml
 - repo: local
@@ -232,6 +248,25 @@ auto-detection alone. A pre-commit hook entry:
       language: system
       pass_filenames: false
 ```
+
+### GitHub Actions
+
+A composite action wraps the same install-then-run steps. Run it in the same job as
+your dependency install step, after your project's own dependencies are already on
+the Python path:
+
+```yaml
+- name: Install dependencies
+  run: pip install -r requirements.txt   # or uv sync, poetry install, ...
+
+- name: Check dependency licenses
+  uses: w-martin/trustedlicenses@v0.1.1
+```
+
+It accepts two optional inputs: `version` (pin the `trustedlicenses` release, as a
+pip version specifier — defaults to latest) and `args` (defaults to `--quiet`). It
+installs with `uv pip install` when `uv` is already on `PATH`, falling back to plain
+`pip install` otherwise.
 
 **A second safety net, in case `--quiet` was left off by mistake:** every individual
 wizard prompt also times out after 30 seconds with no answer. Some CI runners attach

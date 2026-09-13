@@ -162,7 +162,24 @@ i pyproject.toml has no policy configured yet -- showing detected licenses only.
 
 **Use `--quiet` (`-q`) in CI/CD and pre-commit hooks.** Both are non-interactive
 already, so `trustedlicenses` falls back on its own — but pass `--quiet` explicitly
-so that holds even if a step happens to have a terminal attached. A pre-commit hook:
+so that holds even if a step happens to have a terminal attached.
+
+### pre-commit
+
+`trustedlicenses` audits whatever's actually installed in the current Python
+environment, so the hook needs to run with your project's own dependencies already
+installed — not in an isolated hook-specific environment the way most pre-commit
+hooks work. Add `trustedlicenses` as a dev dependency (see
+[Installation](#installation)), then reference this repo directly:
+
+```yaml
+- repo: https://github.com/w-martin/trustedlicenses
+  rev: v0.1.1
+  hooks:
+    - id: trustedlicenses
+```
+
+Or write the same thing as a local hook without depending on this repo's tag:
 
 ```yaml
 - repo: local
@@ -173,6 +190,25 @@ so that holds even if a step happens to have a terminal attached. A pre-commit h
       language: system
       pass_filenames: false
 ```
+
+### GitHub Actions
+
+A composite action wraps the same install-then-run steps. Run it in the same job as
+your dependency install step, after your project's own dependencies are already on
+the Python path:
+
+```yaml
+- name: Install dependencies
+  run: pip install -r requirements.txt   # or uv sync, poetry install, ...
+
+- name: Check dependency licenses
+  uses: w-martin/trustedlicenses@v0.1.1
+```
+
+It accepts two optional inputs: `version` (pin the `trustedlicenses` release, as a
+pip version specifier — defaults to latest) and `args` (defaults to `--quiet`). It
+installs with `uv pip install` when `uv` is already on `PATH`, falling back to plain
+`pip install` otherwise.
 
 As a second safety net if `--quiet` gets left off by mistake, every wizard prompt
 also times out after 30 seconds with no answer — some CI runners attach something

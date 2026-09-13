@@ -23,3 +23,8 @@ site/
 # OS / editor
 .idea/
 .DS_Store
+
+# worktrees
+.claude/worktrees
+.worktrees
+.git/worktrees
