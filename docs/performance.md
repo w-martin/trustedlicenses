@@ -38,34 +38,43 @@ A single synthetic environment, built once and reused for every tool below:
 
 ## Why the fallback scans run concurrently
 
-Detection runs the text-matching fallback across a thread pool
-(`concurrent.futures.ThreadPoolExecutor` in
-[`detect_all()`](https://github.com/w-martin/trustedlicenses/blob/main/src/trustedlicenses/policy.py)),
-and the underlying Rust matcher releases Python's GIL for the duration of each scan
-(`Python::detach` around the `spdx` crate's scan call in
-[`scan_license_text`](https://github.com/w-martin/trustedlicenses/blob/main/rust/src/matcher.rs)).
-Since every package's detection is independent work, this lets the fallback scans
-run genuinely in parallel across multiple cores rather than serializing behind
-Python's interpreter lock.
+Detection collects every package that needs the text-matching fallback across the
+whole run and hands their license-file text to the Rust matcher in a single batched
+call
+([`inspect_distributions()`](https://github.com/w-martin/trustedlicenses/blob/main/src/trustedlicenses/detection.py)
+calling
+[`scan_license_texts()`](https://github.com/w-martin/trustedlicenses/blob/main/rust/src/matcher.rs)).
+That call releases Python's GIL once for the whole batch (`Python::detach`) and
+scans the texts in parallel across CPU cores on the Rust side (`rayon`), rather than
+Python orchestrating a thread pool of one-scan-at-a-time calls into Rust. Since
+every package's detection is independent work, this lets the fallback scans run
+genuinely in parallel across multiple cores rather than serializing behind Python's
+interpreter lock -- and does it without paying a GIL acquire/release or Python
+thread-scheduling cost per package.
 
-This matters because the fallback triggers for 96 of the 425 packages in this
-environment. Breaking down the cost: 322 of 425 packages resolve from declared
-metadata (0.04s total — that path is essentially free); the remaining 7 have no
-license detected via either path and so never reach a fallback scan at all. The 96
-bundled-LICENSE-file text matches take 7.47s combined run serially, some individual
-files
-well over half a second (`docutils`'s `COPYING.rst`, a short but structurally
-complex document mixing a public-domain dedication with several distinct
-third-party license exceptions, takes 781ms; `paramiko`'s and `numba`'s license
-files each take ~670ms). Run one package at a time with the GIL held throughout
-the scan, this same 425-package environment takes **7.7–8.9s** — roughly 6x slower
-than the 1.29s median reported above. The parallelized and serial versions produce
-byte-identical results on this same environment, in the same order; only wall time
-differs.
+This matters because the fallback triggered for 96 of the 425 packages in this
+environment (measured under the earlier thread-pool design -- see below). Breaking
+down the cost: 322 of 425 packages resolve from declared metadata (0.04s total —
+that path is essentially free); the remaining 7 have no license detected via either
+path and so never reach a fallback scan at all. The 96 bundled-LICENSE-file text
+matches took 7.47s combined run serially, some individual files well over half a
+second (`docutils`'s `COPYING.rst`, a short but structurally complex document
+mixing a public-domain dedication with several distinct third-party license
+exceptions, took 781ms; `paramiko`'s and `numba`'s license files each took
+~670ms). Run one package at a time with the GIL held throughout the scan, this
+same 425-package environment took **7.7–8.9s** — roughly 6x slower than the 1.29s
+median reported above.
 
 A pure-Python tool doing the same fallback text-matching work would not get this
 benefit from threading alone — the GIL release in the Rust matcher is what makes
 the scan genuinely multi-core rather than merely concurrent.
+
+**Note:** the numbers in the Results table and this section were measured against
+the Python-thread-pool design (one `scan_license_text` call per package, released
+GIL, running under `ThreadPoolExecutor`), not the current batched `rayon` design
+described above. The two should produce byte-identical detection results, but the
+timings haven't been re-measured against the batched version — treat the numbers
+above as pre-refactor baselines until someone reruns this same environment.
 
 ## `liccheck` couldn't be benchmarked
 

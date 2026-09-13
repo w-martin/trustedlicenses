@@ -36,10 +36,10 @@ from importlib.metadata import distribution
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from trustedlicenses.rust_matcher import scan_license_text
+from trustedlicenses.rust_matcher import scan_license_texts
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Iterable, Mapping
     from importlib.metadata import Distribution
 
 # The category assigned to ScanCode's own "there is clearly a license reference here
@@ -178,12 +178,9 @@ def _keys_from_licence_files(files: list[Path]) -> set[str]:
     Returns:
         The SPDX license identifiers matched anywhere in those files.
     """
-    keys: set[str] = set()
-    for path in files:
-        text = path.read_text(encoding="utf-8", errors="replace")
-        for spdx_id, _score in scan_license_text(text, TEXT_MATCH_CONFIDENCE_THRESHOLD):
-            keys.add(spdx_id)
-    return keys
+    texts = [path.read_text(encoding="utf-8", errors="replace") for path in files]
+    matches = scan_license_texts(texts, TEXT_MATCH_CONFIDENCE_THRESHOLD)
+    return {spdx_id for file_matches in matches for spdx_id, _score in file_matches}
 
 
 def _declared_statements(dist: Distribution) -> list[str]:
@@ -305,6 +302,64 @@ def inspect_distribution(dist: Distribution, name: str | None = None) -> Distrib
         categories=frozenset(_categories(keys)),
         source=source,
     )
+
+
+def inspect_distributions(distributions_by_name: Mapping[str, Distribution]) -> dict[str, DistributionLicence]:
+    """Detect the licenses of many installed distributions at once.
+
+    Equivalent to calling :func:`inspect_distribution` on each entry, but batches the
+    Rust text-matcher fallback across *every* distribution that needs it into a single
+    call, rather than one call per distribution -- see
+    :func:`trustedlicenses.rust_matcher.scan_license_texts` for why that's worth doing
+    (it parallelizes the scan across CPU cores and pays the GIL-release cost once for
+    the whole run instead of once per distribution).
+
+    Args:
+        distributions_by_name: Distributions to inspect, keyed by canonical name.
+
+    Returns:
+        One :class:`DistributionLicence` per input distribution, keyed the same way.
+    """
+    results: dict[str, DistributionLicence] = {}
+    pending: list[tuple[str, list[Path]]] = []
+    for name, dist in distributions_by_name.items():
+        declared_keys = _keys_from_declared(_declared_statements(dist))
+        if declared_keys:
+            results[name] = DistributionLicence(
+                name=name,
+                keys=frozenset(declared_keys),
+                categories=frozenset(_categories(declared_keys)),
+                source="declared metadata",
+            )
+            continue
+        files = _licence_files(_dist_info_dir(dist))
+        if not files:
+            results[name] = DistributionLicence(
+                name=name, keys=frozenset(), categories=frozenset(), source="no license information found"
+            )
+            continue
+        pending.append((name, files))
+
+    if pending:
+        texts_per_dist = [
+            [path.read_text(encoding="utf-8", errors="replace") for path in files] for _, files in pending
+        ]
+        flat_matches = scan_license_texts(
+            [text for texts in texts_per_dist for text in texts], TEXT_MATCH_CONFIDENCE_THRESHOLD
+        )
+        offset = 0
+        for (name, files), texts in zip(pending, texts_per_dist, strict=True):
+            dist_matches = flat_matches[offset : offset + len(texts)]
+            offset += len(texts)
+            keys = {spdx_id for file_matches in dist_matches for spdx_id, _score in file_matches}
+            results[name] = DistributionLicence(
+                name=name,
+                keys=frozenset(keys),
+                categories=frozenset(_categories(keys)),
+                source="license files: " + ", ".join(sorted({path.name for path in files})),
+            )
+
+    return results
 
 
 def inspect_installed(name: str) -> DistributionLicence:

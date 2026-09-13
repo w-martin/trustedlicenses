@@ -62,6 +62,17 @@ def test_evaluate_ignores_packages_in_the_ignore_list(tmp_path: Path) -> None:
     assert result.checked == 0
 
 
+def test_evaluate_fails_a_package_with_no_license_information(tmp_path: Path) -> None:
+    """A package with neither declared metadata nor a bundled license file fails."""
+    dist = make_distribution(tmp_path, "bare", license_text=None)
+    policy = Policy(allowed_categories=frozenset({"Permissive"}))
+
+    result = evaluate(policy, distributions_=[dist])
+
+    assert not result.passed
+    assert result.failures[0].source == "no license information found"
+
+
 def test_evaluate_dedupes_by_canonical_name(tmp_path: Path) -> None:
     """The same distribution appearing twice is only checked once."""
     dist = make_distribution(tmp_path, "Some_Pkg", license_text=MIT_LICENSE_TEXT)
