@@ -27,6 +27,30 @@ Sorensen-Dice matching algorithm.
 Copyright the `spdx` contributors. Licensed under the Apache License, Version 2.0:
 http://www.apache.org/licenses/LICENSE-2.0
 
+## GNU Lesser General Public License, Version 3 (short form)
+
+`rust/tests/fixtures/lgpl-3.0-short-form.txt` -- registered as an additional match
+template alongside the SPDX corpus's own long-form LGPL-3.0 text (see
+`rust/src/matcher.rs`) -- is copied verbatim from the FSF's own publication at
+https://www.gnu.org/licenses/lgpl-3.0.txt.
+
+Copyright (C) 2007 Free Software Foundation, Inc. Verbatim copying and distribution
+of this license document is permitted by its own terms.
+
+## spdx-correct.js
+
+The *approach* behind `src/trustedlicenses/detection.py`'s `_correct_license_statement`
+(reformat punctuation/whitespace/a version number already present in a free-text
+license statement, then trust the result only once it validates as a real SPDX id) is
+adapted from the validated-transform tier of spdx-correct.js
+(https://github.com/jslicense/spdx-correct.js) -- no code from that project is
+included verbatim; this project's transform/transposition tables were written fresh
+in Python, and deliberately omit that library's separate "last resort"
+substring-guessing tier.
+
+Copyright spdx-correct.js contributors. Licensed under the Apache License, Version 2.0:
+http://www.apache.org/licenses/LICENSE-2.0
+
 ## ScanCode Toolkit license category data
 
 The SPDX-license-identifier -> category mapping bundled at

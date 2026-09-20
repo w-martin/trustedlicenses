@@ -15,3 +15,5 @@ policy says whether that's acceptable for *this* project.
 ::: trustedlicenses.format_failure
 
 ::: trustedlicenses.format_remediation
+
+::: trustedlicenses.format_suggestion

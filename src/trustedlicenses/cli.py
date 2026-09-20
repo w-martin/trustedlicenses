@@ -11,8 +11,8 @@ from typing import TYPE_CHECKING
 import typer
 
 from trustedlicenses import wizard
-from trustedlicenses.config import ConfigError, NoPolicyConfiguredError, load_policy
-from trustedlicenses.policy import detect_all, evaluate, format_failure, format_remediation
+from trustedlicenses.config import ConfigError, NoPolicyConfiguredError, load_policy, policy_source
+from trustedlicenses.policy import detect_all, evaluate, format_failure, format_remediation, reevaluate
 from trustedlicenses.resolve import ResolutionError, resolve_packages
 
 if TYPE_CHECKING:
@@ -113,7 +113,10 @@ def _check_environment(pyproject: Path, *, quiet: bool) -> int:
 
     Returns:
         ``0`` if every checked package passed (or nothing is configured to check
-        against yet), ``1`` otherwise.
+        against yet), ``1`` otherwise. When the interactive failure-review wizard
+        (:func:`trustedlicenses.wizard.review_failures`) writes a policy change, this
+        reflects the *re-evaluated* result against the updated policy, not the
+        original failing one.
     """
     try:
         policy = _load_or_configure_policy(pyproject, quiet=quiet)
@@ -133,8 +136,23 @@ def _check_environment(pyproject: Path, *, quiet: bool) -> int:
         return 0
 
     typer.echo("Checking dependency licenses...")
-    result = evaluate(policy)
+    # Detection kept separate from evaluate() here (rather than one evaluate() call)
+    # so a wizard-driven policy change below can be re-checked via reevaluate() alone
+    # -- reusing this same scan -- instead of re-scanning the whole environment (which
+    # can mean re-running the Rust text-matcher fallback for every package that needs
+    # it) just to apply what's actually a pure policy-level change.
+    detected = detect_all(exclude=policy.ignored_packages)
+    result = reevaluate(detected, policy)
     _print_result(result)
+
+    if result.failures and _should_offer_wizard(quiet=quiet):
+        typer.echo("")
+        if wizard.review_failures(policy_source(pyproject), result, policy):
+            typer.echo("\nRe-checking against the updated policy...")
+            policy = load_policy(pyproject)
+            result = reevaluate(detected, policy)
+            _print_result(result)
+
     return 0 if not result.failures else 1
 
 

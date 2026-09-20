@@ -27,7 +27,8 @@ def test_main_returns_zero_when_everything_passes(tmp_path: Path, monkeypatch: p
     pyproject = tmp_path / "pyproject.toml"
     pyproject.write_text('[tool.trustedlicenses]\nallowed-categories = ["Permissive"]\n')
 
-    monkeypatch.setattr(cli, "evaluate", lambda _policy: PolicyResult(failures=(), checked=3))
+    monkeypatch.setattr(cli, "detect_all", lambda **_kwargs: ())
+    monkeypatch.setattr(cli, "reevaluate", lambda _detected, _policy: PolicyResult(failures=(), checked=3))
 
     result = runner.invoke(app, ["--pyproject", str(pyproject)])
 
@@ -43,7 +44,8 @@ def test_main_returns_one_when_a_package_fails(tmp_path: Path, monkeypatch: pyte
         name="gplpkg", keys=frozenset({"gpl-2.0"}), categories=frozenset({"Copyleft"}), source="license files: X"
     )
 
-    monkeypatch.setattr(cli, "evaluate", lambda _policy: PolicyResult(failures=(failure,), checked=3))
+    monkeypatch.setattr(cli, "detect_all", lambda **_kwargs: ())
+    monkeypatch.setattr(cli, "reevaluate", lambda _detected, _policy: PolicyResult(failures=(failure,), checked=3))
 
     result = runner.invoke(app, ["--pyproject", str(pyproject)])
 
@@ -59,10 +61,11 @@ def test_main_prints_compatibility_notes_without_affecting_exit_code(
     pyproject = tmp_path / "pyproject.toml"
     pyproject.write_text('[tool.trustedlicenses]\nallowed-categories = ["Permissive"]\n')
 
+    monkeypatch.setattr(cli, "detect_all", lambda **_kwargs: ())
     monkeypatch.setattr(
         cli,
-        "evaluate",
-        lambda _policy: PolicyResult(failures=(), checked=3, compatibility_notes=("  gplpkg: a note",)),
+        "reevaluate",
+        lambda _detected, _policy: PolicyResult(failures=(), checked=3, compatibility_notes=("  gplpkg: a note",)),
     )
 
     result = runner.invoke(app, ["--pyproject", str(pyproject)])
@@ -143,7 +146,8 @@ def test_main_runs_the_wizard_when_no_policy_and_interactive(tmp_path: Path, mon
 
     monkeypatch.setattr(cli, "_should_offer_wizard", lambda **_kwargs: True)
     monkeypatch.setattr("trustedlicenses.wizard.detect_all", lambda: ())
-    monkeypatch.setattr(cli, "evaluate", lambda _policy: PolicyResult(failures=(), checked=1))
+    monkeypatch.setattr(cli, "detect_all", lambda **_kwargs: ())
+    monkeypatch.setattr(cli, "reevaluate", lambda _detected, _policy: PolicyResult(failures=(), checked=1))
 
     result = runner.invoke(app, ["--pyproject", str(pyproject)], input="y\ny\ny\ny\nn\nn\ny\n")
 
@@ -172,6 +176,97 @@ def test_main_reports_no_policy_when_wizard_is_declined(tmp_path: Path, monkeypa
     assert result.exit_code == 0
     assert "no policy configured" in result.output
     assert not pyproject.read_text().count("[tool.trustedlicenses]")
+
+
+def test_main_does_not_offer_review_when_not_interactive(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failing check with no real terminal attached (the CliRunner default) never offers to review."""
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text('[tool.trustedlicenses]\nallowed-categories = ["Permissive"]\n')
+    failure = DistributionLicence(name="catboost", keys=frozenset(), categories=frozenset(), source="x")
+
+    monkeypatch.setattr(cli, "detect_all", lambda **_kwargs: ())
+    monkeypatch.setattr(cli, "reevaluate", lambda _detected, _policy: PolicyResult(failures=(failure,), checked=1))
+
+    result = runner.invoke(app, ["--pyproject", str(pyproject)])
+
+    assert result.exit_code == 1
+    assert "Review" not in result.output
+
+
+def test_main_does_not_offer_review_with_quiet_even_if_interactive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--quiet suppresses the review offer too, even with a real terminal attached."""
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text('[tool.trustedlicenses]\nallowed-categories = ["Permissive"]\n')
+    failure = DistributionLicence(name="catboost", keys=frozenset(), categories=frozenset(), source="x")
+
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True, raising=False)
+    monkeypatch.setattr(cli, "detect_all", lambda **_kwargs: ())
+    monkeypatch.setattr(cli, "reevaluate", lambda _detected, _policy: PolicyResult(failures=(failure,), checked=1))
+
+    result = runner.invoke(app, ["--pyproject", str(pyproject), "--quiet"])
+
+    assert result.exit_code == 1
+    assert "Review" not in result.output
+
+
+def test_main_offers_review_after_a_failing_check_and_reevaluates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Accepting the review, ignoring the failure, exits 0 against the re-evaluated (now passing) policy.
+
+    Also verifies the efficiency fix directly: detection runs exactly once (the
+    expensive part), even though the policy is folded against it twice.
+    """
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text('[tool.trustedlicenses]\nallowed-categories = ["Permissive"]\n')
+    failure = DistributionLicence(name="catboost", keys=frozenset(), categories=frozenset(), source="x")
+    calls = {"detect_all": 0, "reevaluate": 0}
+
+    def fake_detect_all(**_kwargs: object) -> tuple[DistributionLicence, ...]:
+        calls["detect_all"] += 1
+        return ()
+
+    def fake_reevaluate(_detected: object, _policy: object) -> PolicyResult:
+        calls["reevaluate"] += 1
+        if calls["reevaluate"] == 1:
+            return PolicyResult(failures=(failure,), checked=1)
+        return PolicyResult(failures=(), checked=1)
+
+    monkeypatch.setattr(cli, "_should_offer_wizard", lambda **_kwargs: True)
+    monkeypatch.setattr(cli, "detect_all", fake_detect_all)
+    monkeypatch.setattr(cli, "reevaluate", fake_reevaluate)
+
+    # "review now?" y, choice "i" (ignore catboost), "write?" y
+    result = runner.invoke(app, ["--pyproject", str(pyproject)], input="y\ni\ny\n")
+
+    assert result.exit_code == 0
+    assert "Re-checking against the updated policy" in result.output
+    assert "All 1 packages passed." in result.output
+    assert "catboost" in pyproject.read_text()
+    assert calls["detect_all"] == 1
+    expected_reevaluate_calls = 2  # once before the wizard, once after it writes
+    assert calls["reevaluate"] == expected_reevaluate_calls
+
+
+def test_main_keeps_the_failing_exit_code_when_review_is_declined(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Declining the review's up-front offer leaves the original failure (and exit 1) in place."""
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text('[tool.trustedlicenses]\nallowed-categories = ["Permissive"]\n')
+    failure = DistributionLicence(name="catboost", keys=frozenset(), categories=frozenset(), source="x")
+
+    monkeypatch.setattr(cli, "_should_offer_wizard", lambda **_kwargs: True)
+    monkeypatch.setattr(cli, "detect_all", lambda **_kwargs: ())
+    monkeypatch.setattr(cli, "reevaluate", lambda _detected, _policy: PolicyResult(failures=(failure,), checked=1))
+
+    result = runner.invoke(app, ["--pyproject", str(pyproject)], input="n\n")
+
+    assert result.exit_code == 1
+    assert "Re-checking" not in result.output
+    assert "catboost" not in pyproject.read_text()
 
 
 def test_check_subcommand_reports_pass_for_a_resolved_package(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

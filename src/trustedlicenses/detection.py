@@ -16,19 +16,30 @@ Detection strategy, per installed distribution, in priority order:
    Sorensen-Dice text detection -- a maintained continuation of askalono's algorithm,
    the same family of approach GitHub's own Licensee uses.
 
+Whenever neither of those resolves anything, a small set of deterministic, validated
+corrections (see :func:`_correct_license_statement`) is also tried against the
+declared statements -- reformatting punctuation and a version number already present
+in the text, never guessing one that isn't -- and attached as
+:attr:`DistributionLicence.suggested`. This is deliberately *not* folded into ``keys``
+here: whether a project trusts it is a policy decision (opt-in, off by default -- see
+:mod:`trustedlicenses.policy` and :mod:`trustedlicenses.wizard`), not something
+detection silently decides on its own.
+
 License *categories* (Permissive, Copyleft, Public Domain, ...) are not something SPDX
 itself publishes -- they're an editorial taxonomy. The mapping bundled here
 (``data/spdx_license_categories.json``) was extracted from ScanCode Toolkit's
 CC-BY-4.0-licensed license database; see ``NOTICE`` for the required attribution.
 
 This module only detects and categorizes licenses. Whether a given set of categories
-passes or fails is a policy decision, made by :mod:`trustedlicenses.policy`.
+passes or fails -- and whether a suggested correction is trusted -- is a policy
+decision, made by :mod:`trustedlicenses.policy`.
 """
 
 from __future__ import annotations
 
 import fnmatch
 import json
+import re
 from dataclasses import dataclass
 from functools import lru_cache
 from importlib import resources
@@ -39,7 +50,7 @@ from typing import TYPE_CHECKING
 from trustedlicenses.rust_matcher import scan_license_text
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Callable, Iterable
     from importlib.metadata import Distribution
 
 # The category assigned to ScanCode's own "there is clearly a license reference here
@@ -74,12 +85,18 @@ class DistributionLicence:
             ``"Apache-2.0"``).
         categories: Categories of ``keys``.
         source: Where the detection came from, for a failure report.
+        suggested: ``(declared statement, corrected SPDX id)`` pairs
+            :func:`_correct_license_statement` produced for this distribution's
+            declared statements. Populated whenever ``keys`` came back empty,
+            regardless of whether anything ends up trusting it -- purely
+            informational at this layer; see the module docstring.
     """
 
     name: str
     keys: frozenset[str]
     categories: frozenset[str]
     source: str
+    suggested: frozenset[tuple[str, str]] = frozenset()
 
 
 @lru_cache(maxsize=1)
@@ -243,6 +260,106 @@ def _keys_from_declared(statements: list[str]) -> set[str]:
     return keys
 
 
+# Structural transforms for `_correct_license_statement`: punctuation/whitespace
+# cleanup, and version-number reformatting gated on a digit already present in the
+# text -- never a digit invented from nothing. In particular, no transform pads a
+# bare single-digit version with a fabricated ".0": several families (MPL, OSL, ...)
+# have more than one real minor-version release, so "MPL 1" cannot be corrected
+# without guessing between MPL-1.0 and MPL-1.1 -- exactly the kind of invented
+# specificity this function otherwise refuses to produce. Applied independently to
+# the original candidate (not chained): the first one whose result validates against
+# a real SPDX id wins. Ported from the validated-transform tier of `spdx-correct.js`
+# (jslicense, Apache-2.0 -- see NOTICE).
+_CORRECTION_TRANSFORMS: tuple[Callable[[str], str], ...] = (
+    lambda text: text.replace(".", ""),
+    lambda text: re.sub(r"\s+", "", text),
+    lambda text: re.sub(r"\s+", "-", text),
+    lambda text: re.sub(r",?\s*(\d)", r"-\1", text, count=1),
+    lambda text: re.sub(r",?\s*(?:V\.|v\.|V|v|Version|version)\s*(\d)", r"-\1", text, count=1),
+    lambda text: text.replace("/", "-"),
+)
+
+# A single substring replacement, tried independently, before re-attempting the
+# transforms above on the result. The first four spell out a license family's full
+# name as its acronym, giving a version-number transform a normalized base to work
+# from. The last strips the literal word "License" -- no SPDX identifier in this
+# family ever contains that word, so removing it discards noise, not information; it
+# is not from `spdx-correct.js` (its own transforms don't resolve e.g. "Apache
+# License, Version 2.0" -- verified directly, not assumed).
+_CORRECTION_TRANSPOSITIONS: tuple[tuple[str, str], ...] = (
+    ("GNU Lesser General Public License", "LGPL"),
+    ("GNU Affero General Public License", "AGPL"),
+    ("GNU General Public License", "GPL"),
+    ("Mozilla Public License", "MPL"),
+    (" License", ""),
+)
+
+
+def _correct_license_statement(statement: str) -> str | None:
+    """Try to deterministically correct a free-text statement into a real SPDX id.
+
+    Only ever accepts a result that both changed from the input and resolves to a
+    real, known SPDX identifier via the same case-insensitive table
+    :func:`resolve_license_expression` already trusts -- nothing here is a new source
+    of trust, just a massaged string fed to the same gate.
+
+    Deliberately excludes `spdx-correct.js`'s "last resort" substring-guessing tier
+    (e.g. any string containing "GPL" -> assume ``GPL-3.0-or-later``, any "BSD" ->
+    assume ``BSD-2-Clause``): those guesses manufacture a specific version or variant
+    the text never actually stated -- exactly the auto-inference :pep:`639`'s own
+    appendix says tools "MUST NOT" perform for genuinely ambiguous classifiers (bare
+    "BSD License", bare "GNU General Public License", ...). A statement that's
+    ambiguous in this way simply stays unresolved, same as before this function
+    existed.
+
+    Only meaningful for a statement direct token resolution
+    (:func:`resolve_license_expression`) already found nothing for -- a statement
+    that's already a bare valid token is resolved there first and never reaches this
+    function in practice.
+
+    Args:
+        statement: A single declared license statement.
+
+    Returns:
+        The corrected SPDX identifier, or ``None`` if no transform produces one.
+    """
+    ci_index = _category_table_ci()
+    candidate = statement.strip()
+
+    for transform in _CORRECTION_TRANSFORMS:
+        corrected = transform(candidate).strip()
+        if corrected != candidate and (canonical := ci_index.get(corrected.lower())):
+            return canonical
+
+    for pattern, replacement in _CORRECTION_TRANSPOSITIONS:
+        if pattern not in candidate:
+            continue
+        transposed = candidate.replace(pattern, replacement)
+        if canonical := ci_index.get(transposed.lower()):
+            return canonical
+        for transform in _CORRECTION_TRANSFORMS:
+            corrected = transform(transposed).strip()
+            if corrected != transposed and (canonical := ci_index.get(corrected.lower())):
+                return canonical
+
+    return None
+
+
+def _suggested_corrections(statements: list[str]) -> frozenset[tuple[str, str]]:
+    """Pair declared statements with what :func:`_correct_license_statement` resolves them to.
+
+    Args:
+        statements: Declared license statements that direct token resolution
+            (:func:`_keys_from_declared`) already found nothing for.
+
+    Returns:
+        ``(statement, corrected SPDX id)`` for every statement that corrects to one.
+    """
+    return frozenset(
+        (statement, corrected) for statement in statements if (corrected := _correct_license_statement(statement))
+    )
+
+
 def categories_for(keys: Iterable[str]) -> frozenset[str]:
     """Map SPDX license identifiers to their categories.
 
@@ -283,7 +400,8 @@ def inspect_distribution(dist: Distribution, name: str | None = None) -> Distrib
     """
     resolved_name = name or canonical_name(dist.metadata["Name"] or "")
 
-    declared_keys = _keys_from_declared(_declared_statements(dist))
+    statements = _declared_statements(dist)
+    declared_keys = _keys_from_declared(statements)
     if declared_keys:
         return DistributionLicence(
             name=resolved_name,
@@ -291,6 +409,8 @@ def inspect_distribution(dist: Distribution, name: str | None = None) -> Distrib
             categories=frozenset(_categories(declared_keys)),
             source="declared metadata",
         )
+
+    suggested = _suggested_corrections(statements)
 
     files = _licence_files(_dist_info_dir(dist))
     if files:
@@ -304,6 +424,7 @@ def inspect_distribution(dist: Distribution, name: str | None = None) -> Distrib
         keys=frozenset(keys),
         categories=frozenset(_categories(keys)),
         source=source,
+        suggested=suggested,
     )
 
 

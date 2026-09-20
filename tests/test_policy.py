@@ -6,7 +6,16 @@ from typing import TYPE_CHECKING
 
 from tests.conftest import GPL2_LICENSE_TEXT, MIT_LICENSE_TEXT, make_distribution
 from trustedlicenses.detection import DistributionLicence
-from trustedlicenses.policy import Policy, evaluate, format_failure, format_remediation
+from trustedlicenses.policy import (
+    Policy,
+    _effective_result,
+    _trusted_suggestion_ids,
+    detect_all,
+    evaluate,
+    format_failure,
+    format_remediation,
+    reevaluate,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -193,3 +202,243 @@ def test_evaluate_has_no_compatibility_note_for_a_compatible_copyleft_pairing(tm
     result = evaluate(policy, distributions_=[dist])
 
     assert result.compatibility_notes == ()
+
+
+def _suggested_only(name: str, statement: str, spdx_id: str) -> DistributionLicence:
+    """A detection with nothing resolved except a free-text correction suggestion."""
+    return DistributionLicence(
+        name=name,
+        keys=frozenset(),
+        categories=frozenset(),
+        source="no license information found",
+        suggested=frozenset({(statement, spdx_id)}),
+    )
+
+
+def test_trusted_suggestion_ids_empty_by_default() -> None:
+    """No trust setting at all -- an untrusted suggestion trusts nothing."""
+    detected = _suggested_only("catboost", "Apache License, Version 2.0", "Apache-2.0")
+    policy = Policy(allowed_categories=frozenset({"Permissive"}))
+
+    assert _trusted_suggestion_ids(detected, policy) == frozenset()
+
+
+def test_trusted_suggestion_ids_trusts_the_global_flag() -> None:
+    """trust_corrected_licenses=True trusts every suggested id."""
+    detected = _suggested_only("catboost", "Apache License, Version 2.0", "Apache-2.0")
+    policy = Policy(allowed_categories=frozenset({"Permissive"}), trust_corrected_licenses=True)
+
+    assert _trusted_suggestion_ids(detected, policy) == frozenset({"Apache-2.0"})
+
+
+def test_trusted_suggestion_ids_trusts_a_matching_package_pin() -> None:
+    """A verified_packages pin matching the current suggestion is trusted."""
+    detected = _suggested_only("catboost", "Apache License, Version 2.0", "Apache-2.0")
+    policy = Policy(
+        allowed_categories=frozenset({"Permissive"}),
+        verified_packages={"catboost": ("Apache License, Version 2.0", "Apache-2.0")},
+    )
+
+    assert _trusted_suggestion_ids(detected, policy) == frozenset({"Apache-2.0"})
+
+
+def test_trusted_suggestion_ids_ignores_a_stale_package_pin() -> None:
+    """A pin for text the package no longer declares doesn't apply to its new text."""
+    detected = _suggested_only("catboost", "Some New License Text 3.0", "MIT")
+    policy = Policy(
+        allowed_categories=frozenset({"Permissive"}),
+        verified_packages={"catboost": ("Apache License, Version 2.0", "Apache-2.0")},
+    )
+
+    assert _trusted_suggestion_ids(detected, policy) == frozenset()
+
+
+def test_trusted_suggestion_ids_trusts_a_matching_statement_pin_for_any_package() -> None:
+    """A verified_statements pin applies regardless of which package declares the text."""
+    detected = _suggested_only("some-internal-pkg", "Apache License, Version 2.0", "Apache-2.0")
+    policy = Policy(
+        allowed_categories=frozenset({"Permissive"}),
+        verified_statements={"Apache License, Version 2.0": "Apache-2.0"},
+    )
+
+    assert _trusted_suggestion_ids(detected, policy) == frozenset({"Apache-2.0"})
+
+
+def test_trusted_suggestion_ids_ignores_a_statement_pin_with_a_stale_id() -> None:
+    """If correction would now produce a different id than the pin recorded, don't trust it."""
+    detected = _suggested_only("pkg", "Apache License, Version 2.0", "Apache-2.0")
+    policy = Policy(
+        allowed_categories=frozenset({"Permissive"}),
+        verified_statements={"Apache License, Version 2.0": "Apache-1.0"},
+    )
+
+    assert _trusted_suggestion_ids(detected, policy) == frozenset()
+
+
+def test_effective_result_folds_in_a_trusted_suggestion() -> None:
+    """Trust folds a suggestion into keys/categories/source, as a copy."""
+    detected = _suggested_only("catboost", "Apache License, Version 2.0", "Apache-2.0")
+    policy = Policy(allowed_categories=frozenset({"Permissive"}), trust_corrected_licenses=True)
+
+    effective = _effective_result(detected, policy)
+
+    assert effective.keys == frozenset({"Apache-2.0"})
+    assert effective.categories == frozenset({"Permissive"})
+    assert effective.source == "declared metadata (corrected from free text)"
+    assert detected.keys == frozenset()  # the original is untouched
+
+
+def test_effective_result_is_unchanged_when_nothing_is_trusted() -> None:
+    """No matching trust source -- the detection passes through as-is."""
+    detected = _suggested_only("catboost", "Apache License, Version 2.0", "Apache-2.0")
+    policy = Policy(allowed_categories=frozenset({"Permissive"}))
+
+    assert _effective_result(detected, policy) == detected
+
+
+def test_effective_result_does_not_override_an_existing_match_even_when_trusted() -> None:
+    """A suggestion never outranks a real match (declared token or bundled file), trusted or not."""
+    detected = DistributionLicence(
+        name="filewins",
+        keys=frozenset({"GPL-2.0-or-later"}),
+        categories=frozenset({"Copyleft"}),
+        source="license files: LICENSE",
+        suggested=frozenset({("Apache License, Version 2.0", "Apache-2.0")}),
+    )
+    policy = Policy(allowed_categories=frozenset({"Permissive"}), trust_corrected_licenses=True)
+
+    assert _effective_result(detected, policy) == detected
+
+
+def test_evaluate_fails_an_untrusted_suggestion_by_default(tmp_path: Path) -> None:
+    """A free-text correction is opt-in -- a plain policy doesn't trust it on its own."""
+    dist = make_distribution(tmp_path, "catboost", declared={"License": ["Apache License, Version 2.0"]})
+    policy = Policy(allowed_categories=frozenset({"Permissive"}))
+
+    result = evaluate(policy, distributions_=[dist])
+
+    assert not result.passed
+    assert result.failures[0].suggested == frozenset({("Apache License, Version 2.0", "Apache-2.0")})
+
+
+def test_evaluate_passes_when_trust_corrected_licenses_is_enabled(tmp_path: Path) -> None:
+    """The project-wide flag trusts the correction end-to-end."""
+    dist = make_distribution(tmp_path, "catboost", declared={"License": ["Apache License, Version 2.0"]})
+    policy = Policy(allowed_categories=frozenset({"Permissive"}), trust_corrected_licenses=True)
+
+    result = evaluate(policy, distributions_=[dist])
+
+    assert result.passed
+
+
+def test_evaluate_passes_with_a_matching_verified_package_pin(tmp_path: Path) -> None:
+    """A package-specific pin trusts the correction end-to-end."""
+    dist = make_distribution(tmp_path, "catboost", declared={"License": ["Apache License, Version 2.0"]})
+    policy = Policy(
+        allowed_categories=frozenset({"Permissive"}),
+        verified_packages={"catboost": ("Apache License, Version 2.0", "Apache-2.0")},
+    )
+
+    result = evaluate(policy, distributions_=[dist])
+
+    assert result.passed
+
+
+def test_evaluate_fails_again_after_the_declared_text_changes_under_a_package_pin(tmp_path: Path) -> None:
+    """The whole point of pinning to exact text: a changed statement needs re-review."""
+    dist = make_distribution(tmp_path, "catboost", declared={"License": ["Apache Version 1.0"]})
+    policy = Policy(
+        allowed_categories=frozenset({"Permissive"}),
+        verified_packages={"catboost": ("Apache License, Version 2.0", "Apache-2.0")},
+    )
+
+    result = evaluate(policy, distributions_=[dist])
+
+    assert not result.passed
+    assert result.failures[0].suggested == frozenset({("Apache Version 1.0", "Apache-1.0")})
+
+
+def test_evaluate_passes_with_a_matching_verified_statement_pin_for_any_package(tmp_path: Path) -> None:
+    """A statement-text pin applies regardless of which package declares it."""
+    dist = make_distribution(tmp_path, "some-internal-pkg", declared={"License": ["Apache License, Version 2.0"]})
+    policy = Policy(
+        allowed_categories=frozenset({"Permissive"}),
+        verified_statements={"Apache License, Version 2.0": "Apache-2.0"},
+    )
+
+    result = evaluate(policy, distributions_=[dist])
+
+    assert result.passed
+
+
+def test_evaluate_suggestion_never_overrides_a_bundled_file_match_even_when_trusted(tmp_path: Path) -> None:
+    """A last-resort suggestion can't outrank a real bundled-file match."""
+    dist = make_distribution(
+        tmp_path,
+        "filewins",
+        license_text=GPL2_LICENSE_TEXT,
+        declared={"License": ["Apache License, Version 2.0"]},
+    )
+    policy = Policy(allowed_categories=frozenset({"Permissive"}), trust_corrected_licenses=True)
+
+    result = evaluate(policy, distributions_=[dist])
+
+    assert not result.passed
+    assert result.failures[0].keys == frozenset({"GPL-2.0-or-later"})
+
+
+def test_format_remediation_with_a_suggestion_points_at_trusting_it() -> None:
+    """A failure with an untrusted suggestion is told what it looks like and how to trust it."""
+    failure = DistributionLicence(
+        name="catboost",
+        keys=frozenset(),
+        categories=frozenset(),
+        source="no license information found",
+        suggested=frozenset({("Apache License, Version 2.0", "Apache-2.0")}),
+    )
+
+    line = format_remediation(failure)
+
+    assert "Apache-2.0" in line
+    assert "Apache License, Version 2.0" in line
+    assert "trust-corrected-licenses" in line
+    assert "verified-packages" in line
+    assert "verified-statements" in line
+
+
+def test_reevaluate_matches_evaluate_for_the_same_policy(tmp_path: Path) -> None:
+    """reevaluate(detect_all(...), policy) agrees with evaluate(policy, ...) -- it's the same fold, just split."""
+    dist = make_distribution(tmp_path, "somepkg", license_text=MIT_LICENSE_TEXT)
+    policy = Policy(allowed_categories=frozenset({"Permissive"}))
+
+    via_evaluate = evaluate(policy, distributions_=[dist])
+    via_reevaluate = reevaluate(detect_all(distributions_=[dist]), policy)
+
+    assert via_evaluate == via_reevaluate
+
+
+def test_reevaluate_reapplies_ignored_packages_against_the_new_policy(tmp_path: Path) -> None:
+    """A package not excluded by the policy that produced `detected` is still dropped if newly ignored.
+
+    This is what makes reusing one detection pass safe across a policy change (e.g.
+    the review wizard adding to ignored-packages): reevaluate doesn't trust whatever
+    exclusion `detected` happened to already reflect.
+    """
+    dist = make_distribution(tmp_path, "gplpkg", license_text=GPL2_LICENSE_TEXT)
+    detected = detect_all(distributions_=[dist])  # nothing excluded yet
+    policy = Policy(allowed_categories=frozenset({"Permissive"}), ignored_packages=frozenset({"gplpkg"}))
+
+    result = reevaluate(detected, policy)
+
+    assert result.passed
+    assert result.checked == 0
+
+
+def test_format_remediation_still_suggests_manual_verification_with_no_suggestion() -> None:
+    """A failure with nothing detected and no suggestion still points at manual review."""
+    failure = DistributionLicence(name="bare", keys=frozenset(), categories=frozenset(), source="no source")
+
+    line = format_remediation(failure)
+
+    assert "ignored-packages" in line
+    assert "trust-corrected-licenses" not in line

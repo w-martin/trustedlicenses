@@ -49,6 +49,11 @@ If both exist, the standalone file wins.
   from the check entirely, regardless of what they detect as. Use this for packages
   you've manually verified are fine despite failing automated detection (e.g. a
   package with a `LicenseRef-` custom license your legal team has already reviewed).
+- **`trust-corrected-licenses`**, **`verified-packages`**, **`verified-statements`**
+  (all optional, all off/empty by default) — opt in to trusting a *free-text*
+  `License` field correction (e.g. `"Apache License, Version 2.0"` → `Apache-2.0`).
+  See [Free-text correction](#free-text-correction-opt-in) below; normally set by the
+  interactive review wizard, not by hand.
 
 ### A narrow, FSF-grounded compatibility check
 
@@ -123,6 +128,17 @@ at manual verification instead:
   somepkg: no license detected -- from license files: LICENSE
     -> no license could be detected; verify "somepkg" manually, then add it to
        ignored-packages if acceptable
+```
+
+When nothing was detected but a free-text `License` field looks like a real SPDX id
+once reformatted, the suggestion says so instead — see
+[Free-text correction](#free-text-correction-opt-in):
+
+```
+  catboost: no license detected -- from no license information found
+    -> looks like Apache-2.0 from its declared metadata ("Apache License, Version 2.0"),
+       not trusted by default -- review interactively, or add trust-corrected-licenses /
+       verified-packages / verified-statements to your policy
 ```
 
 A passing run:
@@ -232,7 +248,7 @@ not an isolated hook-specific environment the way most pre-commit hooks work. Ad
 
 ```yaml
 - repo: https://github.com/w-martin/trustedlicenses
-  rev: v0.1.1
+  rev: v0.2.0
   hooks:
     - id: trustedlicenses
 ```
@@ -260,7 +276,7 @@ the Python path:
   run: pip install -r requirements.txt   # or uv sync, poetry install, ...
 
 - name: Check dependency licenses
-  uses: w-martin/trustedlicenses@v0.1.1
+  uses: w-martin/trustedlicenses@v0.2.0
 ```
 
 It accepts two optional inputs: `version` (pin the `trustedlicenses` release, as a
@@ -355,6 +371,50 @@ For each installed distribution, in priority order:
 
 If neither resolves anything, the package reports `no license information found` and
 fails any policy (an unknown license is never assumed to be safe).
+
+### Free-text correction (opt-in)
+
+Some packages declare a free-text `License` field that isn't SPDX syntax but is
+otherwise unambiguous once reformatted — PyPI's `catboost`, for example, ships
+`License: "Apache License, Version 2.0"` with no `License-Expression` field and no
+bundled `LICENSE` file for the text matcher to fall back on. A small set of
+deterministic, validated transforms (reformat punctuation and a version number
+*already present in the text* — see `_correct_license_statement` in `detection.py`)
+tries to turn text like that into a real SPDX id, accepting the result only once it's
+confirmed to be one. It never guesses a version or variant the text doesn't state —
+PEP 639's own appendix says tools "MUST NOT" auto-infer an SPDX id for exactly that
+kind of genuinely ambiguous classifier (bare `"BSD License"`, bare `"GNU General
+Public License"`, ...), and this correction holds to the same rule.
+
+**This is off by default.** A project shouldn't start silently passing packages it
+previously flagged just because detection got smarter than it used to be — trusting
+a correction is something you opt into, at whichever scope fits:
+
+```toml
+[tool.trustedlicenses]
+allowed-categories = ["Permissive"]
+
+# Trust every free-text correction, project-wide, from now on:
+trust-corrected-licenses = true
+
+# Or narrower: pin one package to the exact statement + id you verified. If that
+# package's declared text ever changes, the pin silently stops applying and it needs
+# review again -- it isn't just remembering the package name.
+[tool.trustedlicenses.verified-packages]
+catboost = { statement = "Apache License, Version 2.0", spdx-id = "Apache-2.0" }
+
+# Or narrower still: trust that exact statement text for any package that has it
+# (e.g. several internal packages sharing identical boilerplate).
+[tool.trustedlicenses.verified-statements]
+"Apache License, Version 2.0" = "Apache-2.0"
+```
+
+In practice you won't hand-write these: the interactive review wizard (see
+[No policy configured yet?](#no-policy-configured-yet) for the initial setup wizard —
+this is its counterpart, offered after a *failing* check against an existing policy)
+walks through each failure and, for one a correction applies to, offers to verify
+just that package, trust that exact text everywhere, or — when two or more of the
+current failures would resolve — enable it project-wide in one step.
 
 ### The text-matching algorithm
 

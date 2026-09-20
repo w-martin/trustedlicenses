@@ -132,6 +132,123 @@ def test_inspect_distribution_free_text_license_field_without_a_bundled_file_is_
     assert result.categories == frozenset()
 
 
+def test_inspect_distribution_suggests_catboosts_real_world_free_text_license_field(tmp_path: Path) -> None:
+    """The string "Apache License, Version 2.0" (catboost's actual PyPI ``License`` field) is suggested, not trusted.
+
+    The word "License" sitting between the name and the version blocks a direct
+    reformat, so this specifically exercises the "strip the word License, then
+    reformat" correction path, not just a plain punctuation/whitespace transform.
+    Correction is opt-in (see policy.py) -- detection surfaces the suggestion but
+    never folds it into ``keys`` on its own.
+    """
+    dist = make_distribution(tmp_path, "catboost", declared={"License": ["Apache License, Version 2.0"]})
+
+    result = inspect_distribution(dist, name="catboost")
+
+    assert result.keys == frozenset()
+    assert result.categories == frozenset()
+    assert result.source == "no license information found"
+    assert result.suggested == frozenset({("Apache License, Version 2.0", "Apache-2.0")})
+
+
+def test_inspect_distribution_suggests_via_a_direct_transform_with_no_transposition_needed(
+    tmp_path: Path,
+) -> None:
+    """A statement with no redundant "License" word is suggested via a transform alone."""
+    dist = make_distribution(tmp_path, "directcase", declared={"License": ["Apache Version 2.0"]})
+
+    result = inspect_distribution(dist, name="directcase")
+
+    assert result.keys == frozenset()
+    assert result.suggested == frozenset({("Apache Version 2.0", "Apache-2.0")})
+
+
+def test_inspect_distribution_suggests_a_family_name_reformatted_via_its_acronym(tmp_path: Path) -> None:
+    """A full family name (not just an acronym) is spelled out to its acronym first."""
+    dist = make_distribution(tmp_path, "mozillapkg", declared={"License": ["Mozilla Public License, Version 2.0"]})
+
+    result = inspect_distribution(dist, name="mozillapkg")
+
+    assert result.keys == frozenset()
+    assert result.suggested == frozenset({("Mozilla Public License, Version 2.0", "MPL-2.0")})
+
+
+def test_inspect_distribution_suggestion_does_not_override_a_bundled_file(tmp_path: Path) -> None:
+    """An untrusted suggestion never outranks an actual bundled-file match.
+
+    Unlike declared *tokens* (which always win over a file), a free-text
+    *suggestion* is a last resort that needs explicit policy-level trust to count at
+    all -- at the detection layer it's purely informational, so the file match wins.
+    """
+    dist = make_distribution(
+        tmp_path,
+        "filewins",
+        license_text=GPL2_LICENSE_TEXT,
+        declared={"License": ["Apache License, Version 2.0"]},
+    )
+
+    result = inspect_distribution(dist, name="filewins")
+
+    assert result.keys == frozenset({"GPL-2.0-or-later"})
+    assert result.source == "license files: LICENSE"
+    assert result.suggested == frozenset({("Apache License, Version 2.0", "Apache-2.0")})
+
+
+def test_inspect_distribution_falls_back_to_file_when_correction_also_fails(tmp_path: Path) -> None:
+    """An unresolvable free-text field with a bundled file still falls back to the file."""
+    dist = make_distribution(
+        tmp_path,
+        "fallsback",
+        license_text=MIT_LICENSE_TEXT,
+        declared={"License": ["Zope Public License"]},
+    )
+
+    result = inspect_distribution(dist, name="fallsback")
+
+    assert result.keys == frozenset({"MIT"})
+    assert result.source == "license files: LICENSE"
+    assert result.suggested == frozenset()
+
+
+def test_inspect_distribution_does_not_guess_a_versionless_gpl_variant(tmp_path: Path) -> None:
+    """No bare GPL-3.0 key exists (only -only/-or-later) -- correction must not invent one.
+
+    PEP 639's own appendix says tools "MUST NOT" auto-infer an SPDX id for exactly
+    this kind of versioned-but-variant-ambiguous classifier text.
+    """
+    dist = make_distribution(tmp_path, "gplfree", declared={"License": ["GNU General Public License, Version 3"]})
+
+    result = inspect_distribution(dist, name="gplfree")
+
+    assert result.keys == frozenset()
+    assert result.suggested == frozenset()
+
+
+def test_inspect_distribution_does_not_guess_an_unversioned_bsd_variant(tmp_path: Path) -> None:
+    """The string "BSD License" alone has no clause count -- stays unresolved, not guessed at."""
+    dist = make_distribution(tmp_path, "bsdfree", declared={"License": ["BSD License"]})
+
+    result = inspect_distribution(dist, name="bsdfree")
+
+    assert result.keys == frozenset()
+    assert result.suggested == frozenset()
+
+
+def test_inspect_distribution_does_not_fabricate_a_minor_version(tmp_path: Path) -> None:
+    """A bare integer version isn't padded into a specific, possibly-wrong minor release.
+
+    MPL has two real single-digit-major releases (MPL-1.0 and MPL-1.1) -- "MPL 1"
+    doesn't say which, so correction must not guess ".0" any more than it guesses a
+    GPL -only/-or-later suffix.
+    """
+    dist = make_distribution(tmp_path, "mplfree", declared={"License": ["MPL 1"]})
+
+    result = inspect_distribution(dist, name="mplfree")
+
+    assert result.keys == frozenset()
+    assert result.suggested == frozenset()
+
+
 def test_inspect_distribution_defaults_name_from_metadata(tmp_path: Path) -> None:
     """Omitting the name argument derives it from the distribution's own metadata."""
     dist = make_distribution(tmp_path, "Some_Pkg", license_text=MIT_LICENSE_TEXT)

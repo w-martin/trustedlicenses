@@ -26,7 +26,7 @@
 use pyo3::prelude::*;
 use spdx::detection::{
     scan::{ScanMode, Scanner},
-    Store, TextData,
+    LicenseType, Store, TextData,
 };
 use std::sync::OnceLock;
 
@@ -43,9 +43,58 @@ use std::sync::OnceLock;
 /// BSD-3 variants).
 const DEFAULT_CONFIDENCE_THRESHOLD: f32 = 0.8;
 
+/// The license id(s) the inline corpus might key the LGPL-3.0 entry under -- see
+/// `register_lgpl_3_0_short_form` for why both are attempted.
+const LGPL_3_0_IDS: [&str; 2] = ["LGPL-3.0-only", "LGPL-3.0-or-later"];
+
+/// The FSF's own short-form publication of LGPL-3.0, verbatim from
+/// <https://www.gnu.org/licenses/lgpl-3.0.txt>: the ~1,230-word supplement that
+/// references GPLv3 by pointer rather than re-embedding it. SPDX's `license-list-data`
+/// -- and so this crate's inline corpus -- only ships the long form (that supplement
+/// plus the full GPLv3 text inline, ~6,878 words), so a package shipping the short form
+/// scores ~0 against it and is reported as having no detectable license, even though the
+/// short form is what the FSF itself publishes and what most LGPLv3 packages actually
+/// bundle. Verified directly against a real installed package: `cons` on PyPI ships a
+/// `LICENSE.txt` byte-identical (modulo the copyright notice's `http`/`https` scheme) to
+/// gnu.org's own text, and it was going undetected before this was added.
+const LGPL_3_0_SHORT_FORM: &str = include_str!("../tests/fixtures/lgpl-3.0-short-form.txt");
+
 fn store() -> &'static Store {
     static STORE: OnceLock<Store> = OnceLock::new();
-    STORE.get_or_init(|| Store::load_inline().expect("inline SPDX detection cache is malformed"))
+    STORE.get_or_init(|| {
+        let mut store = Store::load_inline().expect("inline SPDX detection cache is malformed");
+        register_lgpl_3_0_short_form(&mut store);
+        store
+    })
+}
+
+/// Register the short-form LGPL-3.0 text as an alternate under whichever LGPL-3.0 id(s)
+/// the inline corpus actually keys on. Not assumed to be exactly one of `LGPL_3_0_IDS`:
+/// the corpus is an opaque compiled blob (see `inline_cache.rs`), so both are attempted
+/// and at least one succeeding is treated as success.
+///
+/// A hard `assert!` here would panic inside `store()`'s `OnceLock` initializer, and
+/// this crate builds with `panic = "abort"` (see `Cargo.toml`) -- a panic wouldn't just
+/// fail one scan, it would abort the whole process for every caller of this library.
+/// Degrading to "the corpus no longer has this enhancement" (silently skip it) is far
+/// preferable to crashing every license check over one optional match template, so
+/// this uses `debug_assert!`: it still catches a real regression via `cargo test`
+/// (which runs in the debug profile, where this fires), without that risk in the
+/// release wheel `debug_assert!` compiles away to nothing in.
+fn register_lgpl_3_0_short_form(store: &mut Store) {
+    let data = TextData::new(LGPL_3_0_SHORT_FORM);
+    let registered = LGPL_3_0_IDS
+        .iter()
+        .filter(|id| {
+            store
+                .add_variant(id, LicenseType::Alternate, data.clone())
+                .is_ok()
+        })
+        .count();
+    debug_assert!(
+        registered > 0,
+        "inline SPDX corpus no longer contains any LGPL-3.0 entry to attach the short form to"
+    );
 }
 
 /// Scan `text` for SPDX-licensed text, returning every match that clears
@@ -93,6 +142,8 @@ mod tests {
 
     const MIT: &str = include_str!("../tests/fixtures/mit.txt");
     const GPL_2_0: &str = include_str!("../tests/fixtures/gpl-2.0.txt");
+    const GPL_3_0: &str = include_str!("../tests/fixtures/gpl-3.0.txt");
+    const LGPL_3_0_SHORT: &str = include_str!("../tests/fixtures/lgpl-3.0-short-form.txt");
 
     #[test]
     fn finds_a_single_license() {
@@ -112,6 +163,43 @@ mod tests {
         assert!(
             names.contains(&"GPL-2.0-or-later"),
             "expected GPL-2.0-or-later in {names:?}"
+        );
+    }
+
+    #[test]
+    fn finds_the_short_form_lgpl_3_0_supplement() {
+        // The FSF's own gnu.org publication of LGPL-3.0 -- the short supplement that
+        // references GPLv3 by pointer -- which the SPDX corpus doesn't ship a template
+        // for on its own. See `register_lgpl_3_0_short_form`.
+        let matches = Python::attach(|py| {
+            scan_license_text(py, LGPL_3_0_SHORT, DEFAULT_CONFIDENCE_THRESHOLD)
+        });
+        assert_eq!(
+            matches.len(),
+            1,
+            "expected exactly one match, got {matches:?}"
+        );
+        assert!(
+            matches[0].0.starts_with("LGPL-3.0"),
+            "expected an LGPL-3.0 id, got {matches:?}"
+        );
+        assert!(matches[0].1 > 0.9);
+    }
+
+    #[test]
+    fn does_not_misidentify_gpl_3_0_as_lgpl() {
+        // Regression guard for the short-form LGPL alternate added above: a plain GPL-3.0
+        // text must still resolve to GPL-3.0, not get pulled toward the new LGPL variant.
+        let matches =
+            Python::attach(|py| scan_license_text(py, GPL_3_0, DEFAULT_CONFIDENCE_THRESHOLD));
+        assert_eq!(
+            matches.len(),
+            1,
+            "expected exactly one match, got {matches:?}"
+        );
+        assert!(
+            matches[0].0.starts_with("GPL-3.0"),
+            "expected a GPL-3.0 id, got {matches:?}"
         );
     }
 

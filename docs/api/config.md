@@ -10,6 +10,12 @@ interactive setup wizard (:mod:`trustedlicenses.wizard`) to write it.
 
 ::: trustedlicenses.write_policy
 
+::: trustedlicenses.policy_source
+
+::: trustedlicenses.add_to_policy
+
+::: trustedlicenses.CorrectionTrust
+
 ::: trustedlicenses.ConfigError
 
 ::: trustedlicenses.NoPolicyConfiguredError

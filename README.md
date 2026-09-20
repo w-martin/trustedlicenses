@@ -8,7 +8,7 @@
 
 > ⚠️ **Project Status: Experimental**
 >
-> `trustedlicenses` (v0.1.1) is an early, experimental release. Detection, policy
+> `trustedlicenses` (v0.2.0) is an early, experimental release. Detection, policy
 > evaluation, and the CLI work end-to-end with full test coverage, but the API and
 > config format aren't stable yet, and license detection — declared-metadata parsing
 > and the Rust text-matching fallback alike — can be wrong. See the
@@ -174,7 +174,7 @@ hooks work. Add `trustedlicenses` as a dev dependency (see
 
 ```yaml
 - repo: https://github.com/w-martin/trustedlicenses
-  rev: v0.1.1
+  rev: v0.2.0
   hooks:
     - id: trustedlicenses
 ```
@@ -202,7 +202,7 @@ the Python path:
   run: pip install -r requirements.txt   # or uv sync, poetry install, ...
 
 - name: Check dependency licenses
-  uses: w-martin/trustedlicenses@v0.1.1
+  uses: w-martin/trustedlicenses@v0.2.0
 ```
 
 It accepts two optional inputs: `version` (pin the `trustedlicenses` release, as a

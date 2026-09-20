@@ -1,32 +1,46 @@
 """Interactive setup: guide a user through configuring a policy, with explanations.
 
-Run by :mod:`trustedlicenses.cli` when no policy is configured yet and the session
-looks interactive (a real terminal attached, ``--quiet`` not passed) -- see that
-module for the guard that decides whether to offer this at all. Never launches in a
-non-interactive context (CI, pre-commit, piped input) on its own.
+Two independent flows live here:
+
+- :func:`run` -- initial ``allowed-categories`` setup, offered by :mod:`trustedlicenses.cli`
+  when no policy is configured yet.
+- :func:`review_failures` -- walks through a failing check's failures one at a time,
+  offering to add each to ``ignored-packages``, allow its category, or -- for a
+  failure with a free-text correction available -- trust that correction (for just
+  that package, for that exact declared text everywhere, or project-wide if enough
+  failures would *actually pass* once it's enabled). Offered after a failing check
+  against an *existing* policy.
+
+Both only run when the session looks interactive (a real terminal attached, ``--quiet``
+not passed) -- see :mod:`trustedlicenses.cli`'s ``_should_offer_wizard`` guard. Neither
+launches in a non-interactive context (CI, pre-commit, piped input) on its own.
 
 Every prompt is also individually time-boxed (see ``PROMPT_TIMEOUT_SECONDS``): a
 ``--quiet``-less CI/pre-commit job that somehow still has a real terminal attached
 (some runners do) would otherwise hang forever waiting for an answer nobody's there
-to give. A timeout aborts the wizard the same way a declined setup does -- see
-:func:`run`.
+to give. A timeout aborts either flow the same way a declined one does -- see
+:func:`run` and :func:`review_failures`.
 """
 
 from __future__ import annotations
 
 import threading
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, TypeVar, cast
 
 import typer
 
-from trustedlicenses.config import write_policy
-from trustedlicenses.policy import detect_all
+from trustedlicenses.config import CorrectionTrust, add_to_policy, write_policy
+from trustedlicenses.detection import categories_for
+from trustedlicenses.policy import detect_all, format_failure
 
 if TYPE_CHECKING:
     from collections.abc import Callable
     from pathlib import Path
 
     from trustedlicenses.detection import DistributionLicence
+    from trustedlicenses.policy import Policy, PolicyResult
 
 # (category, explanation, default answer) -- the vocabulary this project's own docs
 # and examples already treat as the common case; the default answers mirror the
@@ -224,3 +238,261 @@ def _run(pyproject_path: Path) -> Path | None:
     written = write_policy(pyproject_path, allowed_categories=allowed, standalone=standalone)
     typer.secho(f"\nWrote policy to {written}.", fg="green", bold=True)
     return written
+
+
+# Single-letter answers for the per-failure prompt in review_failures -- short enough to
+# type without a full menu system, and echoed in the option text itself (e.g. "[i]gnore")
+# so nothing needs to be memorized.
+_IGNORE_CHOICE = "i"
+_ALLOW_CATEGORY_CHOICE = "a"
+_BULK_IGNORE_CHOICE = "b"
+_VERIFY_PACKAGE_CHOICE = "v"
+_TRUST_TEXT_CHOICE = "t"
+_SKIP_CHOICE = "s"
+_QUIT_CHOICE = "q"
+
+# Below this many failures a free-text correction would resolve, per-case pinning
+# (verify/trust choices below) is the expected path; at or above it, offering to
+# enable correction project-wide saves repetitive pinning. Matches
+# `_NAME_INDIVIDUALLY_UP_TO`'s threshold deliberately -- both are "is this worth
+# naming individually, or just a count" judgment calls, and there's no reason for
+# them to disagree.
+_OFFER_BLANKET_CORRECTION_AT = _NAME_INDIVIDUALLY_UP_TO
+
+
+@dataclass
+class _ReviewDecisions:
+    """Decisions accumulated across one `review_failures` walkthrough, written once at the end."""
+
+    ignored: dict[str, str] = field(default_factory=dict)
+    allowed_categories: set[str] = field(default_factory=set)
+    verified_packages: dict[str, tuple[str, str]] = field(default_factory=dict)
+    verified_statements: dict[str, str] = field(default_factory=dict)
+    trust_corrected_licenses: bool = False
+
+    def has_decisions(self) -> bool:
+        """Whether anything was actually decided -- nothing to write otherwise."""
+        return bool(
+            self.ignored
+            or self.allowed_categories
+            or self.verified_packages
+            or self.verified_statements
+            or self.trust_corrected_licenses
+        )
+
+
+def _today() -> str:
+    """Today's date, for the "accepted <date>" reason recorded on a new ignored-packages entry."""
+    return datetime.now(UTC).date().isoformat()
+
+
+def _reason_for(failure: DistributionLicence, today: str) -> str:
+    """The reason comment recorded when a failure is accepted into ignored-packages."""
+    if failure.keys:
+        return f"detected {', '.join(sorted(failure.keys))} -- accepted {today}"
+    return f"no license detected -- accepted {today}"
+
+
+def _primary_suggestion(failure: DistributionLicence) -> tuple[str, str]:
+    """The ``(statement, spdx id)`` pair to show/pin for a failure with more than one.
+
+    Multiple declared statements each correcting differently is rare enough (an edge
+    case, not a real scenario seen in practice) that a sub-menu to choose between them
+    isn't worth it -- the lexicographically first is picked and shown plainly instead.
+    """
+    return min(failure.suggested)
+
+
+def _failure_options(failure: DistributionLicence) -> str:
+    """The choice menu for one failure, tailored to what's known about it."""
+    options = [f"[{_IGNORE_CHOICE}]gnore this package"]
+    if failure.categories:
+        categories = ", ".join(sorted(failure.categories))
+        options.append(f'[{_ALLOW_CATEGORY_CHOICE}]llow "{categories}" (every package in it, not just this one)')
+    else:
+        options.append(f"[{_BULK_IGNORE_CHOICE}]ulk-ignore every remaining undetectable package")
+    if failure.suggested:
+        statement, spdx_id = _primary_suggestion(failure)
+        options.append(f"[{_VERIFY_PACKAGE_CHOICE}]erify this package as {spdx_id} (re-checked if its text changes)")
+        options.append(f'[{_TRUST_TEXT_CHOICE}]rust "{statement}" -> {spdx_id} for any package')
+    options.extend([f"[{_SKIP_CHOICE}]kip", f"[{_QUIT_CHOICE}]uit reviewing"])
+    return "  " + "; ".join(options)
+
+
+def _apply_choice(
+    choice: str,
+    failure: DistributionLicence,
+    today: str,
+    decisions: _ReviewDecisions,
+) -> tuple[bool, bool]:
+    """Apply one prompted choice for a failure, mutating `decisions`.
+
+    Args:
+        choice: The raw answer to the per-failure prompt.
+        failure: The failure the choice applies to.
+        today: Precomputed :func:`_today`, so every reason in one review shares a date.
+        decisions: Accumulated decisions so far, mutated in place.
+
+    Returns:
+        ``(quit_requested, bulk_ignore_requested)``.
+    """
+    if choice == _QUIT_CHOICE:
+        return True, False
+    if choice == _BULK_IGNORE_CHOICE and not failure.categories:
+        decisions.ignored[failure.name] = _reason_for(failure, today)
+        return False, True
+
+    if choice == _IGNORE_CHOICE:
+        decisions.ignored[failure.name] = _reason_for(failure, today)
+    elif choice == _ALLOW_CATEGORY_CHOICE and failure.categories:
+        decisions.allowed_categories |= failure.categories
+    elif choice == _VERIFY_PACKAGE_CHOICE and failure.suggested:
+        decisions.verified_packages[failure.name] = _primary_suggestion(failure)
+    elif choice == _TRUST_TEXT_CHOICE and failure.suggested:
+        statement, spdx_id = _primary_suggestion(failure)
+        decisions.verified_statements[statement] = spdx_id
+    elif choice != _SKIP_CHOICE:
+        typer.secho(f'  "{choice}" isn\'t one of the options above -- skipping {failure.name}.', fg="yellow")
+    return False, False
+
+
+def _summarize_and_write(source: Path, decisions: _ReviewDecisions) -> bool:
+    """Show accumulated review decisions, confirm, and write them -- or write nothing."""
+    if not decisions.has_decisions():
+        typer.echo("\nNothing selected -- nothing to write.")
+        return False
+
+    typer.secho("\nAbout to update:", fg="green", bold=True)
+    if decisions.trust_corrected_licenses:
+        typer.echo("  enable free-text license correction project-wide")
+    for category in sorted(decisions.allowed_categories):
+        typer.echo(f'  allow category "{category}"')
+    for name, reason in sorted(decisions.ignored.items()):
+        typer.echo(f"  ignore {name}  # {reason}")
+    for name, (statement, spdx_id) in sorted(decisions.verified_packages.items()):
+        typer.echo(f'  verify {name} as {spdx_id} (text: "{statement}")')
+    for statement, spdx_id in sorted(decisions.verified_statements.items()):
+        typer.echo(f'  trust "{statement}" -> {spdx_id} for any package')
+    typer.echo(f"\n  -> {source}")
+
+    if not _confirm("\nWrite these changes?", default=True):
+        return False
+
+    add_to_policy(
+        source,
+        ignored_packages=list(decisions.ignored),
+        allowed_categories=sorted(decisions.allowed_categories),
+        reasons=decisions.ignored,
+        trust=CorrectionTrust(
+            enabled=decisions.trust_corrected_licenses or None,
+            verified_packages=decisions.verified_packages,
+            verified_statements=decisions.verified_statements,
+        ),
+    )
+    typer.secho(f"\nUpdated {source}.", fg="green", bold=True)
+    return True
+
+
+def review_failures(source: Path, result: PolicyResult, policy: Policy) -> bool:
+    """Interactively review a failed check's failures, offering to fix the policy.
+
+    Args:
+        source: The policy file to write any decisions to -- see
+            :func:`trustedlicenses.config.policy_source`.
+        result: The failed evaluation to review.
+        policy: The policy that produced `result` -- needed to tell whether enabling
+            free-text correction would actually resolve a given failure (its
+            corrected category has to be in `policy.allowed_categories`, not just
+            exist), not just whether a correction was found at all.
+
+    Returns:
+        Whether anything was written to `source`. ``False`` covers declining up front,
+        selecting nothing, declining the final confirmation, and a prompt timing out --
+        callers should treat all of these exactly like an unreviewed failure.
+    """
+    try:
+        return _review_failures(source, result, policy)
+    except _PromptTimeoutError:
+        typer.secho(
+            f"\nNo answer received within {PROMPT_TIMEOUT_SECONDS:.0f}s -- stopping the review. "
+            "Nothing has been written.",
+            fg="yellow",
+            bold=True,
+        )
+        return False
+
+
+def _would_pass_if_corrected(failure: DistributionLicence, policy: Policy) -> bool:
+    """Whether trusting *any* of a failure's suggestions would land it in an allowed category.
+
+    Having a suggestion at all isn't enough -- the corrected id still has to map to a
+    category `policy.allowed_categories` actually accepts, exactly like a real
+    declared id would have to. Without this check, the blanket-correction offer would
+    overcount: a suggestion that corrects to e.g. MPL-2.0 doesn't help a
+    Permissive-only policy just because *some* suggestion exists.
+    """
+    suggested_ids = {spdx_id for _statement, spdx_id in failure.suggested}
+    return bool(categories_for(suggested_ids) & policy.allowed_categories)
+
+
+def _offer_blanket_correction(
+    remaining: list[DistributionLicence], decisions: _ReviewDecisions, policy: Policy
+) -> list[DistributionLicence]:
+    """Offer to enable free-text correction project-wide when enough failures need it.
+
+    Args:
+        remaining: Failures not yet reviewed.
+        decisions: Mutated in place with ``trust_corrected_licenses = True`` if accepted.
+        policy: The policy failures were evaluated against -- see :func:`review_failures`.
+
+    Returns:
+        ``remaining`` with the now-resolved failures removed, if accepted; unchanged
+        otherwise (declined, or below :data:`_OFFER_BLANKET_CORRECTION_AT`) -- those
+        stay in the per-failure walkthrough, each still individually offered the
+        narrower verify/trust choices.
+    """
+    correctable = [failure for failure in remaining if _would_pass_if_corrected(failure, policy)]
+    if len(correctable) < _OFFER_BLANKET_CORRECTION_AT:
+        return remaining
+
+    if len(correctable) <= _NAME_INDIVIDUALLY_UP_TO:
+        named = ", ".join(failure.name for failure in correctable)
+    else:
+        named = f"{len(correctable)} packages"
+    accepted = _confirm(
+        f"\n{len(correctable)} failure(s) would resolve if free-text license correction were enabled "
+        f"project-wide ({named}). Enable it now?",
+        default=False,
+    )
+    if not accepted:
+        return remaining
+
+    decisions.trust_corrected_licenses = True
+    return [failure for failure in remaining if failure not in correctable]
+
+
+def _review_failures(source: Path, result: PolicyResult, policy: Policy) -> bool:
+    """The review's actual prompt sequence -- see :func:`review_failures` for the timeout wrapper."""
+    if not _confirm(f"Review these {len(result.failures)} failing package(s) now?", default=False):
+        return False
+
+    decisions = _ReviewDecisions()
+    today = _today()
+    remaining = _offer_blanket_correction(list(result.failures), decisions, policy)
+
+    bulk_ignore_undetectable = False
+    for failure in remaining:
+        if bulk_ignore_undetectable and not failure.categories:
+            decisions.ignored[failure.name] = _reason_for(failure, today)
+            continue
+
+        typer.echo(f"\n{format_failure(failure)}")
+        typer.echo(_failure_options(failure))
+        choice = _prompt("  Choice", default=_SKIP_CHOICE).strip().lower()
+
+        quit_requested, bulk_requested = _apply_choice(choice, failure, today, decisions)
+        bulk_ignore_undetectable = bulk_ignore_undetectable or bulk_requested
+        if quit_requested:
+            break
+
+    return _summarize_and_write(source, decisions)
