@@ -30,6 +30,18 @@ jobs:
       - name: Install dependencies
         run: uv sync
 
+      - name: Locate Python's shared library for cargo test
+        # pyo3's `auto-initialize` (a [dev-dependencies]-only feature -- see
+        # rust/Cargo.toml) dynamically links the compiled test binary against
+        # libpython at *runtime*, not just build time. uv's managed Python is built
+        # with a real shared library, but its directory isn't on the default linker
+        # search path, so `cargo test` fails with "libpython3.11.so.1.0: cannot open
+        # shared object file" without this. `sysconfig.get_config_var("LIBDIR")` asks
+        # the exact interpreter `rust/.cargo/config.toml` points PYO3_PYTHON at
+        # (`uv sync`'s venv) where its own shared library actually lives, rather than
+        # hard-coding a uv cache path that changes with the Python version.
+        run: echo "LD_LIBRARY_PATH=$(uv run python -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')" >> "$GITHUB_ENV"
+
       - name: Rust format check
         run: cargo fmt --all -- --check
         working-directory: rust
