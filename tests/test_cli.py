@@ -340,3 +340,78 @@ def test_check_subcommand_reports_a_broken_config(tmp_path: Path) -> None:
 
     assert result.exit_code == 1
     assert "allowed-categories" in result.output
+
+
+def _fake_index(monkeypatch: pytest.MonkeyPatch, *, error: str | None = None) -> list[tuple[str, str, str]]:
+    from trustedlicenses import index  # noqa: PLC0415
+
+    calls: list[tuple[str, str, str]] = []
+
+    def audit(_client: object, url: str, package: str, version: str) -> str:
+        calls.append((url, package, version))
+        if error:
+            raise index.IndexQueryError(error)
+        return f"{package} {version}"
+
+    monkeypatch.setattr(index, "HttpClient", object)
+    monkeypatch.setattr(index, "audit_package", audit)
+    monkeypatch.setattr(index, "format_audit", lambda result: f"FINDING: {result}")
+    return calls
+
+
+def test_index_check_uses_the_lockfile_index_and_the_installed_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The subcommand asks the index the lockfile names, and says which one before asking."""
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text("[project]\nname = 'x'\n")
+    (tmp_path / "uv.lock").write_text(
+        '[[package]]\nname = "pytest"\nversion = "1"\nsource = { registry = "https://nexus.example.com/simple" }\n'
+    )
+    calls = _fake_index(monkeypatch)
+
+    result = runner.invoke(app, ["--pyproject", str(pyproject), "index-check", "pytest"])
+
+    assert result.exit_code == 0
+    assert "https://nexus.example.com/simple (from uv.lock)" in result.output
+    assert "FINDING: pytest" in result.output
+    assert calls[0][0] == "https://nexus.example.com/simple"
+    assert calls[0][1] == "pytest"
+    assert calls[0][2]  # pytest is installed here, so its version is passed
+
+
+def test_index_check_reports_an_unreachable_index_and_exits_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed query is an explained error and a non-zero exit, not a traceback."""
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text("[project]\nname = 'x'\n")
+    _fake_index(monkeypatch, error="Could not reach https://nexus: connection refused.")
+
+    result = runner.invoke(app, ["--pyproject", str(pyproject), "index-check", "webencodings"])
+
+    assert result.exit_code == 1
+    assert "Could not reach" in result.output
+
+
+def test_index_check_handles_a_package_that_is_not_installed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Not installed -> still works, considering every release (empty installed version)."""
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text("[project]\nname = 'x'\n")
+    calls = _fake_index(monkeypatch)
+
+    result = runner.invoke(app, ["--pyproject", str(pyproject), "index-check", "definitely-not-installed-xyz"])
+
+    assert result.exit_code == 0
+    assert calls[0][2] == ""
+
+
+def test_a_plain_check_never_imports_the_network_code() -> None:
+    """The offline promise: a normal run doesn't load trustedlicenses.index at all."""
+    import subprocess  # noqa: PLC0415
+    import sys  # noqa: PLC0415
+
+    code = "import sys, trustedlicenses, trustedlicenses.cli; print('trustedlicenses.index' in sys.modules)"
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)  # noqa: S603
+
+    assert out.stdout.strip() == "False"

@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import sys
 import tempfile
-from importlib.metadata import distributions
+from importlib.metadata import PackageNotFoundError, distributions
+from importlib.metadata import version as installed_version
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -235,3 +236,49 @@ def check(
 ) -> None:
     """Check whether package(s) could be added without a license problem, before adding them."""
     raise typer.Exit(code=_check_new_packages(ctx.obj["pyproject"], packages, quiet=ctx.obj["quiet"]))
+
+
+def _index_check(pyproject: Path, package: str) -> int:
+    """Ask the package index whether a newer release of ``package`` ships a license.
+
+    Explicit and opt-in -- a plain check never does this. Only ``package``'s name is
+    sent, to the index the project's own lockfile/config points at (printed first), with
+    credentials taken from the environment.
+
+    Args:
+        pyproject: Path to the project's ``pyproject.toml`` -- its directory is where
+            lockfiles and index configuration are read from.
+        package: The package to ask about.
+
+    Returns:
+        ``0`` on an answer (including "no newer release"), ``1`` if the index couldn't be
+        queried.
+    """
+    from trustedlicenses import index, index_discovery  # noqa: PLC0415 -- opt-in, keep off the plain-check path
+
+    choice = index_discovery.discover_index(pyproject.parent, package)
+    typer.echo(f"Asking {index_discovery.redact_url(choice.url)} (from {choice.origin}) about {package!r}...")
+    try:
+        current = installed_version(package)
+    except PackageNotFoundError:
+        current = ""
+    try:
+        audit = index.audit_package(index.HttpClient(), choice.url, package, current)
+    except index.IndexQueryError as error:
+        typer.secho(f"trustedlicenses: {error}", fg="red", bold=True)
+        return 1
+    typer.echo(index.format_audit(audit))
+    return 0
+
+
+@app.command(name="index-check")
+def index_check(
+    ctx: typer.Context,
+    package: str = typer.Argument(..., help="Package to look up, e.g. webencodings"),
+) -> None:
+    """Ask the package index whether a newer release of a package ships a license.
+
+    Opt-in: sends only the package name to the index your project's lockfile/config
+    points at. Also reports what that index supports -- safe to run anywhere.
+    """
+    raise typer.Exit(code=_index_check(ctx.obj["pyproject"], package))

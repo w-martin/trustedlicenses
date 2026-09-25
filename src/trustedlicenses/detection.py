@@ -90,6 +90,8 @@ class DistributionLicence:
             declared statements. Populated whenever ``keys`` came back empty,
             regardless of whether anything ends up trusting it -- purely
             informational at this layer; see the module docstring.
+        version: The installed version, so a later, opt-in index check knows what
+            "newer" means. Empty when unknown.
     """
 
     name: str
@@ -97,6 +99,7 @@ class DistributionLicence:
     categories: frozenset[str]
     source: str
     suggested: frozenset[tuple[str, str]] = frozenset()
+    version: str = ""
 
 
 @lru_cache(maxsize=1)
@@ -141,13 +144,19 @@ def _dist_info_dir(dist: Distribution) -> Path | None:
         dist: The installed distribution.
 
     Returns:
-        The distribution's ``.dist-info`` directory, or ``None`` when it records no
-        file list to derive it from.
+        The distribution's ``.dist-info`` directory, or ``None`` when neither its
+        file list nor its own metadata path identifies one.
     """
     for file in dist.files or []:
         parts = file.parts
         if parts and parts[0].endswith(".dist-info"):
             return Path(str(file.locate())).parents[len(parts) - 2]
+
+    # No RECORD (some conda/distro/repackaged installs): a path-backed distribution
+    # still knows the directory its METADATA was read from, which is the dist-info dir.
+    metadata_dir = getattr(dist, "_path", None)
+    if isinstance(metadata_dir, Path) and metadata_dir.name.endswith(".dist-info"):
+        return metadata_dir
     return None
 
 
@@ -408,6 +417,7 @@ def inspect_distribution(dist: Distribution, name: str | None = None) -> Distrib
             keys=frozenset(declared_keys),
             categories=frozenset(_categories(declared_keys)),
             source="declared metadata",
+            version=dist.version,
         )
 
     suggested = _suggested_corrections(statements)
@@ -425,6 +435,7 @@ def inspect_distribution(dist: Distribution, name: str | None = None) -> Distrib
         categories=frozenset(_categories(keys)),
         source=source,
         suggested=suggested,
+        version=dist.version,
     )
 
 

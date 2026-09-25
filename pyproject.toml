@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "trustedlicenses"
-version = "0.2.0"
+version = "0.3.0"
 description = "Policy-driven license auditing for installed Python dependencies, preferring declared package metadata and falling back to license-text matching."
 keywords = ["license", "compliance", "license-check", "spdx", "dependencies", "audit"]
 readme = "README.md"
@@ -28,6 +28,7 @@ classifiers = [
 dependencies = [
     "typer>=0.27.2",
     "tomlkit>=0.15.1",
+    "packaging>=24.2",
 ]
 
 [project.urls]
@@ -88,6 +89,8 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["S101", "SLF001"]
+# Small fakes and local-server handlers in tests don't need per-method docstrings.
+"tests/test_index.py" = ["D102", "D107"]
 # Verbatim canonical license text used as a test fixture (sourced from the `spdx`
 # crate's own bundled SPDX corpus) -- FSF's GPL-2.0 paragraphs run well past 120
 # columns; rewrapping them would mean the fixture is no longer the actual text.

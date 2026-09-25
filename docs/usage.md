@@ -248,7 +248,7 @@ not an isolated hook-specific environment the way most pre-commit hooks work. Ad
 
 ```yaml
 - repo: https://github.com/w-martin/trustedlicenses
-  rev: v0.2.0
+  rev: v0.3.0
   hooks:
     - id: trustedlicenses
 ```
@@ -276,7 +276,7 @@ the Python path:
   run: pip install -r requirements.txt   # or uv sync, poetry install, ...
 
 - name: Check dependency licenses
-  uses: w-martin/trustedlicenses@v0.2.0
+  uses: w-martin/trustedlicenses@v0.3.0
 ```
 
 It accepts two optional inputs: `version` (pin the `trustedlicenses` release, as a
@@ -332,6 +332,47 @@ terminal without `--quiet`, it offers the same wizard first, then checks the
 candidate against whatever you just configured; non-interactively (or with
 `--quiet`), it exits `1` with a message pointing at the docs instead, since there's
 nothing sensible to fall back to when you're specifically asking "would this pass?"
+
+## Would upgrading help? (opt-in, uses the network)
+
+The usual fix for "no license information found" is a newer release: `webencodings`
+0.5.1 bundles no license file, 0.6.0 and later do. `trustedlicenses` can ask your
+package index whether a newer release of a package declares one. Nothing in a plain
+check does this — it is only ever run on request, from the review wizard (choose
+**c**heck the package index on an undetected package) or directly:
+
+```shell
+$ trustedlicenses index-check webencodings
+Asking https://pypi.org/simple (from default -- no index is configured for this project) about 'webencodings'...
+  Index: https://pypi.org/simple
+    credentials: none; JSON API: yes; separate metadata (PEP 658): yes
+  webencodings 0.5.1:
+    0.6.0 is the first newer release that ships a license (License-File: LICENSE).
+    The latest release is 0.6.1.
+    -> upgrading to webencodings>=0.6.0 would let this be detected. ...
+```
+
+**Which index it asks.** The one your project already uses, in this order: the
+lockfile's recorded source for that package (`uv.lock`, `poetry.lock`,
+`Pipfile.lock` — correct even with several indexes), then index settings in
+`pyproject.toml`/`uv.toml`/`Pipfile`, then `UV_DEFAULT_INDEX` / `UV_INDEX_URL` /
+`PIP_INDEX_URL` and `pip.conf`. It says which it chose, and only falls back to pypi.org
+when nothing is configured (labelled as a default). The wizard asks before sending
+anything.
+
+**What is sent.** Only the package name, to that index. Credentials are *not* managed
+by this tool: they come from your environment — `user:password@` in the index URL, or
+`.netrc` (`NETRC` to point elsewhere) — and are never forwarded if the index redirects
+to a different host. A private CA is picked up from `SSL_CERT_FILE`; proxy settings from
+the usual `HTTPS_PROXY` variables.
+
+**What it can tell.** It works with any index that speaks the standard simple API. Where
+the index offers per-release metadata (PEP 658, as PyPI does) that is all it reads;
+otherwise it downloads the wheel (up to 25 MB) to look inside. The line under
+`Index:` tells you which your index supports. A release "ships a license" if it
+declares a license file or a license the tool can resolve, so a wheel that bundles a
+file without declaring it can be missed. Whether your other dependencies allow the
+upgrade is up to your resolver.
 
 ## Embedding in code
 

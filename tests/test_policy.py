@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import pytest
+
 from tests.conftest import GPL2_LICENSE_TEXT, MIT_LICENSE_TEXT, make_distribution
 from trustedlicenses.detection import DistributionLicence
 from trustedlicenses.policy import (
@@ -69,6 +71,37 @@ def test_evaluate_ignores_packages_in_the_ignore_list(tmp_path: Path) -> None:
 
     assert result.passed
     assert result.checked == 0
+
+
+@pytest.mark.parametrize("stripped_first", [True, False])
+def test_detect_all_result_does_not_depend_on_duplicate_install_order(tmp_path: Path, *, stripped_first: bool) -> None:
+    """Two installs of one package -- one stripped of its license file -- resolve the same either way round."""
+    stripped_dir = tmp_path / "stripped"
+    intact_dir = tmp_path / "intact"
+    stripped_dir.mkdir()
+    intact_dir.mkdir()
+    stripped = make_distribution(stripped_dir, "webencodings")
+    intact = make_distribution(intact_dir, "webencodings", license_text=MIT_LICENSE_TEXT)
+    dists = [stripped, intact] if stripped_first else [intact, stripped]
+
+    results = detect_all(distributions_=dists)
+
+    assert len(results) == 1
+    assert results[0].keys == frozenset({"MIT"})
+
+
+def test_detect_all_keeps_the_first_copy_when_no_copy_resolves(tmp_path: Path) -> None:
+    """Nothing resolves anywhere -- still exactly one result per package, not one per copy."""
+    first_dir = tmp_path / "first"
+    second_dir = tmp_path / "second"
+    first_dir.mkdir()
+    second_dir.mkdir()
+    dists = [make_distribution(first_dir, "bare"), make_distribution(second_dir, "bare")]
+
+    results = detect_all(distributions_=dists)
+
+    assert [result.name for result in results] == ["bare"]
+    assert results[0].keys == frozenset()
 
 
 def test_evaluate_dedupes_by_canonical_name(tmp_path: Path) -> None:

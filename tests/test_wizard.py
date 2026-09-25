@@ -223,8 +223,11 @@ def _failure(
     keys: frozenset[str] = frozenset(),
     categories: frozenset[str] = frozenset(),
     suggested: frozenset[tuple[str, str]] = frozenset(),
+    version: str = "",
 ) -> DistributionLicence:
-    return DistributionLicence(name=name, keys=keys, categories=categories, source="x", suggested=suggested)
+    return DistributionLicence(
+        name=name, keys=keys, categories=categories, source="x", suggested=suggested, version=version
+    )
 
 
 def _write_policy_file(tmp_path: Path) -> Path:
@@ -561,6 +564,119 @@ def test_review_failures_aborts_gracefully_when_a_prompt_is_never_answered(
 
     assert written is False
     assert pyproject.read_text() == original
+
+
+class _FakeIndex:
+    """Stands in for trustedlicenses.index so wizard tests never touch the network."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, *, error: str | None = None) -> None:
+        from trustedlicenses import index  # noqa: PLC0415
+
+        self.calls: list[tuple[str, str, str]] = []
+        self.error = error
+        monkeypatch.setattr(index, "HttpClient", object)
+        monkeypatch.setattr(index, "audit_package", self._audit)
+        monkeypatch.setattr(index, "format_audit", lambda audit: f"AUDIT for {audit}")
+
+    def _audit(self, _client: object, url: str, package: str, version: str) -> str:
+        from trustedlicenses import index  # noqa: PLC0415
+
+        self.calls.append((url, package, version))
+        if self.error:
+            raise index.IndexQueryError(self.error)
+        return f"{package} {version}"
+
+
+def test_undetected_failures_are_offered_the_index_check() -> None:
+    """The menu offers it only when nothing was detected -- there's nothing to upgrade for otherwise."""
+    assert "[c]heck" in wizard._failure_options(_failure("webencodings"))
+    assert "[c]heck" not in wizard._failure_options(_failure("mitpkg", keys=frozenset({"MIT"})))
+
+
+def test_index_check_declined_sends_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Saying no to "Ask <index>?" sends nothing, and the failure is asked about again."""
+    pyproject = _write_policy_file(tmp_path)
+    fake = _FakeIndex(monkeypatch)
+    result = PolicyResult(failures=(_failure("webencodings", version="0.5.1"),), checked=1)
+    # review? yes; ask index? NO -> re-prompt -> skip
+    _patch_prompts(monkeypatch, _ScriptedAnswers([True, False], prompts=["c", "s"]))
+
+    written = wizard.review_failures(pyproject, result, load_policy(pyproject))
+
+    assert written is False
+    assert fake.calls == []
+    out = capsys.readouterr().out
+    assert 'about "webencodings"' in out
+    assert "Only its name is sent" in out
+
+
+def test_index_check_accepted_reports_then_asks_again_and_writes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Yes -> the finding is printed and the same failure is re-asked; the check itself never writes."""
+    pyproject = _write_policy_file(tmp_path)
+    original = pyproject.read_text()
+    fake = _FakeIndex(monkeypatch)
+    result = PolicyResult(failures=(_failure("webencodings", version="0.5.1"),), checked=1)
+    _patch_prompts(monkeypatch, _ScriptedAnswers([True, True], prompts=["c", "s"]))
+    monkeypatch.setattr(wizard.typer, "echo", lambda *args, **_kwargs: print(*args))  # noqa: T201 -- capture
+
+    written = wizard.review_failures(pyproject, result, load_policy(pyproject))
+
+    assert written is False
+    assert pyproject.read_text() == original
+    assert len(fake.calls) == 1
+    assert fake.calls[0][1:] == ("webencodings", "0.5.1")
+    assert "AUDIT for webencodings 0.5.1" in capsys.readouterr().out
+
+
+def test_index_check_can_be_followed_by_a_real_decision(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """After looking, the user can still ignore the package in the same visit."""
+    pyproject = _write_policy_file(tmp_path)
+    _FakeIndex(monkeypatch)
+    result = PolicyResult(failures=(_failure("webencodings", version="0.5.1"),), checked=1)
+    # review? yes; ask index? yes; write? yes -- choices: c then i (ignore)
+    _patch_prompts(monkeypatch, _ScriptedAnswers([True, True, True], prompts=["c", "i"]))
+
+    written = wizard.review_failures(pyproject, result, load_policy(pyproject))
+
+    assert written is True
+    assert "webencodings" in load_policy(pyproject).ignored_packages
+
+
+def test_index_check_failure_is_shown_not_raised(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An unreachable/unauthorised index prints its explanation and the review carries on."""
+    pyproject = _write_policy_file(tmp_path)
+    _FakeIndex(monkeypatch, error="https://nexus rejected the request (401). Credentials come from your environment.")
+    result = PolicyResult(failures=(_failure("webencodings", version="0.5.1"),), checked=1)
+    _patch_prompts(monkeypatch, _ScriptedAnswers([True, True], prompts=["c", "s"]))
+
+    written = wizard.review_failures(pyproject, result, load_policy(pyproject))
+
+    assert written is False
+    assert "rejected the request (401)" in capsys.readouterr().out
+
+
+def test_index_check_choice_is_not_valid_for_a_detected_package(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """'c' isn't on the menu when something was detected, so it's treated as any other invalid choice."""
+    pyproject = _write_policy_file(tmp_path)
+    fake = _FakeIndex(monkeypatch)
+    result = PolicyResult(
+        failures=(_failure("gplpkg", keys=frozenset({"GPL-3.0-only"}), categories=frozenset({"Copyleft"})),),
+        checked=1,
+    )
+    _patch_prompts(monkeypatch, _ScriptedAnswers([True], prompts=["c"]))
+
+    wizard.review_failures(pyproject, result, load_policy(pyproject))
+
+    assert fake.calls == []
+    assert "isn't one of the options" in capsys.readouterr().out
 
 
 def test_with_timeout_reraises_the_underlying_error_promptly() -> None:

@@ -249,6 +249,15 @@ def test_inspect_distribution_does_not_fabricate_a_minor_version(tmp_path: Path)
     assert result.suggested == frozenset()
 
 
+def test_inspect_distribution_records_the_installed_version(tmp_path: Path) -> None:
+    """The version is carried through so an opt-in index check knows what "newer" means."""
+    declared = make_distribution(tmp_path, "declaredpkg", declared={"License-Expression": ["MIT"]})
+    bare = make_distribution(tmp_path, "barepkg")
+
+    assert inspect_distribution(declared, name="declaredpkg").version == "1.0"
+    assert inspect_distribution(bare, name="barepkg").version == "1.0"
+
+
 def test_inspect_distribution_defaults_name_from_metadata(tmp_path: Path) -> None:
     """Omitting the name argument derives it from the distribution's own metadata."""
     dist = make_distribution(tmp_path, "Some_Pkg", license_text=MIT_LICENSE_TEXT)
@@ -258,15 +267,26 @@ def test_inspect_distribution_defaults_name_from_metadata(tmp_path: Path) -> Non
     assert result.name == "some-pkg"
 
 
-def test_inspect_distribution_with_no_file_list_has_no_dist_info(tmp_path: Path) -> None:
-    """A distribution with no RECORD file can't have its bundled LICENSE located.
+def test_inspect_distribution_finds_the_license_file_without_a_record(tmp_path: Path) -> None:
+    """No RECORD (dist.files is None) doesn't hide a license file sitting in the dist-info dir.
 
-    dist.files is None without a RECORD, so detection finds no license file (and has
-    no declared metadata either).
+    The dist-info directory is recovered from the distribution's own metadata path
+    instead of the file list.
     """
     dist = make_distribution(tmp_path, "norecord", license_text=MIT_LICENSE_TEXT, include_record=False)
+    assert dist.files is None
 
     result = inspect_distribution(dist, name="norecord")
+
+    assert result.keys == frozenset({"MIT"})
+    assert result.source == "license files: LICENSE"
+
+
+def test_inspect_distribution_with_no_record_and_no_license_file_detects_nothing(tmp_path: Path) -> None:
+    """Without a RECORD *and* without a bundled file there is still nothing to find."""
+    dist = make_distribution(tmp_path, "norecord-nofile", include_record=False)
+
+    result = inspect_distribution(dist, name="norecord-nofile")
 
     assert result.keys == frozenset()
     assert result.source == "no license information found"

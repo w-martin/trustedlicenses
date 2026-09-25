@@ -248,6 +248,7 @@ _ALLOW_CATEGORY_CHOICE = "a"
 _BULK_IGNORE_CHOICE = "b"
 _VERIFY_PACKAGE_CHOICE = "v"
 _TRUST_TEXT_CHOICE = "t"
+_CHECK_INDEX_CHOICE = "c"
 _SKIP_CHOICE = "s"
 _QUIT_CHOICE = "q"
 
@@ -315,6 +316,8 @@ def _failure_options(failure: DistributionLicence) -> str:
         statement, spdx_id = _primary_suggestion(failure)
         options.append(f"[{_VERIFY_PACKAGE_CHOICE}]erify this package as {spdx_id} (re-checked if its text changes)")
         options.append(f'[{_TRUST_TEXT_CHOICE}]rust "{statement}" -> {spdx_id} for any package')
+    if not failure.keys:
+        options.append(f"[{_CHECK_INDEX_CHOICE}]heck the package index for a version that ships a license")
     options.extend([f"[{_SKIP_CHOICE}]kip", f"[{_QUIT_CHOICE}]uit reviewing"])
     return "  " + "; ".join(options)
 
@@ -471,6 +474,52 @@ def _offer_blanket_correction(
     return [failure for failure in remaining if failure not in correctable]
 
 
+def _run_index_check(failure: DistributionLicence, project_dir: Path) -> None:
+    """Ask the package index whether a newer release of one failing package ships a license.
+
+    Purely informational -- writes nothing. Confirms the index (and why it was chosen)
+    before anything is sent, since guessing wrong could send an internal package's name
+    to a public host. Imported lazily: a plain check never loads the network code.
+
+    Args:
+        failure: The failing package.
+        project_dir: The project directory, where lockfiles and index config live.
+    """
+    from trustedlicenses import index, index_discovery  # noqa: PLC0415 -- opt-in, keep off the plain-check path
+
+    choice = index_discovery.discover_index(project_dir, failure.name)
+    shown = index_discovery.redact_url(choice.url)
+    if not _confirm(
+        f'\nAsk {shown} (from {choice.origin}) about "{failure.name}"? Only its name is sent.', default=False
+    ):
+        return
+    try:
+        audit = index.audit_package(index.HttpClient(), choice.url, failure.name, failure.version)
+    except index.IndexQueryError as error:
+        typer.secho(f"  {error}", fg="yellow")
+        return
+    typer.echo(index.format_audit(audit))
+
+
+def _ask_choice(failure: DistributionLicence, project_dir: Path) -> str:
+    """Show one failure's menu and read the answer, re-asking after an informational index check.
+
+    Args:
+        failure: The failure being reviewed.
+        project_dir: The project directory, for the index check.
+
+    Returns:
+        The answer to act on -- never the index-check choice, which is handled here.
+    """
+    while True:
+        typer.echo(f"\n{format_failure(failure)}")
+        typer.echo(_failure_options(failure))
+        choice = _prompt("  Choice", default=_SKIP_CHOICE).strip().lower()
+        if choice != _CHECK_INDEX_CHOICE or failure.keys:
+            return choice
+        _run_index_check(failure, project_dir)
+
+
 def _review_failures(source: Path, result: PolicyResult, policy: Policy) -> bool:
     """The review's actual prompt sequence -- see :func:`review_failures` for the timeout wrapper."""
     if not _confirm(f"Review these {len(result.failures)} failing package(s) now?", default=False):
@@ -486,9 +535,7 @@ def _review_failures(source: Path, result: PolicyResult, policy: Policy) -> bool
             decisions.ignored[failure.name] = _reason_for(failure, today)
             continue
 
-        typer.echo(f"\n{format_failure(failure)}")
-        typer.echo(_failure_options(failure))
-        choice = _prompt("  Choice", default=_SKIP_CHOICE).strip().lower()
+        choice = _ask_choice(failure, source.parent)
 
         quit_requested, bulk_requested = _apply_choice(choice, failure, today, decisions)
         bulk_ignore_undetectable = bulk_ignore_undetectable or bulk_requested

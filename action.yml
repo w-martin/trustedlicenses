@@ -8,8 +8,8 @@ branding:
 inputs:
   version:
     description: >
-      trustedlicenses version to install, as a pip version specifier (e.g. "0.1.1"
-      or ">=0.1,<0.2"). Defaults to the latest release on PyPI.
+      trustedlicenses version to install, as a pip version specifier (e.g. "0.3.0"
+      or ">=0.3,<0.4"). Defaults to the latest release on PyPI.
     required: false
     default: ''
   args:

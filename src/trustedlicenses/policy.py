@@ -255,13 +255,17 @@ def detect_all(
         (canonical-name-deduped) distribution, sorted by name.
     """
     # distributions() yields one entry per sys.path location a distribution is
-    # importable from, so the same package can come back more than once.
-    to_inspect: dict[str, Distribution] = {}
+    # importable from, so the same package can come back more than once -- and the
+    # copies can differ (one stripped of its license file, one not). All copies are
+    # inspected and the best result kept, so the outcome doesn't depend on sys.path order.
+    to_inspect: dict[str, list[Distribution]] = {}
     for dist in distributions_ if distributions_ is not None else distributions():
         name = canonical_name(dist.metadata["Name"] or "")
-        if not name or name in exclude or name in to_inspect:
+        if not name or name in exclude:
             continue
-        to_inspect[name] = dist
+        to_inspect.setdefault(name, []).append(dist)
+
+    jobs = [(name, dist) for name, dists in to_inspect.items() for dist in dists]
 
     # Most packages resolve from declared metadata (microseconds); the minority that
     # fall back to the Rust text matcher can each take tens to hundreds of milliseconds
@@ -269,8 +273,25 @@ def detect_all(
     # pool actually parallelizes that work, since the matcher releases the GIL for the
     # scan itself, rather than running every package's detection strictly one at a time.
     with ThreadPoolExecutor() as executor:
-        results = executor.map(lambda item: inspect_distribution(item[1], name=item[0]), to_inspect.items())
-    return tuple(sorted(results, key=lambda result: result.name))
+        inspected = list(executor.map(lambda job: inspect_distribution(job[1], name=job[0]), jobs))
+
+    by_name: dict[str, list[DistributionLicence]] = {}
+    for result in inspected:
+        by_name.setdefault(result.name, []).append(result)
+    return tuple(sorted((_best_result(copies) for copies in by_name.values()), key=lambda result: result.name))
+
+
+def _best_result(copies: list[DistributionLicence]) -> DistributionLicence:
+    """Pick the most informative detection among several installs of one package.
+
+    Args:
+        copies: Detections for each copy of the same distribution, in discovery order.
+
+    Returns:
+        The first copy that resolved a license, else the first with a suggested
+        correction, else the first copy.
+    """
+    return next((copy for copy in copies if copy.keys), next((copy for copy in copies if copy.suggested), copies[0]))
 
 
 def evaluate(policy: Policy, distributions_: Iterable[Distribution] | None = None) -> PolicyResult:
