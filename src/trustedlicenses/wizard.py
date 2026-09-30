@@ -144,19 +144,31 @@ def _prompt(text: str, *, default: str) -> str:
     return _with_timeout(typer.prompt, text, default=default, show_default=False)
 
 
-def _category_summary(detected: tuple[DistributionLicence, ...], category: str) -> str:
-    """Describe how many detected packages fall into one category, and which.
+def _category_summary(detected: tuple[DistributionLicence, ...], category: str, already_allowed: frozenset[str]) -> str:
+    """Describe how many detected packages *still need* one category allowed, and which.
+
+    A package with more than one detected category (e.g. its own BSD-3-Clause grant
+    alongside a vendored GPL notice -- see the "pandas case" in
+    :mod:`trustedlicenses.policy`) only needs *one* of its categories allowed to pass.
+    Counting it against every category it happens to touch is actively misleading: it
+    makes allowing e.g. Copyleft look mandatory for a package that's already covered by
+    Permissive, when it isn't. So a package already covered by an earlier answer in this
+    same walkthrough is excluded here, not just counted differently -- the question
+    "do I need to allow this?" should only ever be asked about packages that still do.
 
     Args:
         detected: Every package's detection, from :func:`~trustedlicenses.policy.detect_all`.
         category: The category to summarize, e.g. ``"Copyleft"``.
+        already_allowed: Categories already confirmed earlier in this walkthrough.
 
     Returns:
         ``"(none detected in your environment)"``, ``"(N detected)"``, or --
         specifically for 1 or 2 matches, where naming them is still skimmable --
         ``"(N detected: name (KEYS), ...)"``.
     """
-    matches = [result for result in detected if category in result.categories]
+    matches = [
+        result for result in detected if category in result.categories and not (result.categories & already_allowed)
+    ]
     if not matches:
         return "(none detected in your environment)"
     if len(matches) <= _NAME_INDIVIDUALLY_UP_TO:
@@ -205,13 +217,17 @@ def _run(pyproject_path: Path) -> Path | None:
     allowed: list[str] = []
     for category, explanation, default in _PRIMARY_CATEGORIES:
         typer.echo(f"{category}: {explanation}")
-        typer.echo(f"  {_category_summary(detected, category)}")
+        typer.echo(f"  {_category_summary(detected, category, frozenset(allowed))}")
         if _confirm(f"Allow {category} licenses?", default=default):
             allowed.append(category)
         typer.echo("")
 
+    # Same principle as _category_summary: don't suggest a category for a package
+    # some earlier answer already covers.
+    already_allowed = frozenset(allowed)
     other_categories = sorted(
-        {category for result in detected for category in result.categories} - _PRIMARY_CATEGORY_NAMES
+        {category for result in detected if not (result.categories & already_allowed) for category in result.categories}
+        - _PRIMARY_CATEGORY_NAMES
     )
     if other_categories:
         typer.echo(f"Also detected in your environment: {', '.join(other_categories)}.")

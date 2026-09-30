@@ -125,6 +125,38 @@ def test_run_reports_a_per_category_count_and_names_when_one_or_two(
     assert "(1 detected: gplpkg (GPL-3.0-only))" in output
 
 
+def test_run_does_not_count_a_package_already_covered_by_an_earlier_allowance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The scipy case: a package with both Permissive and Copyleft doesn't make Copyleft look mandatory.
+
+    scipy's own grant is BSD-3-Clause (Permissive); its bundled LICENSE also carries
+    vendored GPL notices, so it detects as both categories. Once Permissive is
+    allowed, scipy is already covered -- it must not still show up under Copyleft's
+    summary, which would wrongly suggest allowing Copyleft is required for it.
+    """
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text("[project]\nname = 'x'\n")
+    scipy_like = DistributionLicence(
+        name="scipy",
+        keys=frozenset({"BSD-3-Clause", "GPL-3.0-or-later"}),
+        categories=frozenset({"Permissive", "Copyleft"}),
+        source="x",
+    )
+    monkeypatch.setattr(wizard, "detect_all", lambda: (scipy_like,))
+    # setup? yes; Permissive? yes; Public Domain? no; Copyleft Limited? no; Copyleft? no
+    _patch_prompts(monkeypatch, _ScriptedAnswers([True, True, False, False, False]))
+    monkeypatch.setattr(wizard.typer, "echo", lambda *args, **_kwargs: print(*args))  # noqa: T201 -- capture for capsys
+
+    wizard.run(pyproject)
+
+    output = capsys.readouterr().out
+    assert "Copyleft:" in output
+    copyleft_section = output.split("Copyleft:", 1)[1]
+    assert "scipy" not in copyleft_section
+    assert "(none detected in your environment)" in copyleft_section
+
+
 def test_run_returns_none_when_guided_setup_is_declined_up_front(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -248,7 +248,7 @@ not an isolated hook-specific environment the way most pre-commit hooks work. Ad
 
 ```yaml
 - repo: https://github.com/w-martin/trustedlicenses
-  rev: v0.3.0
+  rev: v0.3.1
   hooks:
     - id: trustedlicenses
 ```
@@ -276,7 +276,7 @@ the Python path:
   run: pip install -r requirements.txt   # or uv sync, poetry install, ...
 
 - name: Check dependency licenses
-  uses: w-martin/trustedlicenses@v0.3.0
+  uses: w-martin/trustedlicenses@v0.3.1
 ```
 
 It accepts two optional inputs: `version` (pin the `trustedlicenses` release, as a
