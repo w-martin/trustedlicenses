@@ -8,7 +8,7 @@
 
 > ⚠️ **Project Status: Experimental**
 >
-> `trustedlicenses` (v0.3.1) is an early, experimental release. Detection, policy
+> `trustedlicenses` (v0.3.2) is an early, experimental release. Detection, policy
 > evaluation, and the CLI work end-to-end with full test coverage, but the API and
 > config format aren't stable yet, and license detection — declared-metadata parsing
 > and the Rust text-matching fallback alike — can be wrong. See the
@@ -174,7 +174,7 @@ hooks work. Add `trustedlicenses` as a dev dependency (see
 
 ```yaml
 - repo: https://github.com/w-martin/trustedlicenses
-  rev: v0.3.1
+  rev: v0.3.2
   hooks:
     - id: trustedlicenses
 ```
@@ -202,7 +202,7 @@ the Python path:
   run: pip install -r requirements.txt   # or uv sync, poetry install, ...
 
 - name: Check dependency licenses
-  uses: w-martin/trustedlicenses@v0.3.1
+  uses: w-martin/trustedlicenses@v0.3.2
 ```
 
 It accepts two optional inputs: `version` (pin the `trustedlicenses` release, as a
@@ -236,6 +236,27 @@ Checking 5 package(s) (requested plus transitive dependencies)...
     -> add "Copyleft Limited" to allowed-categories, or "certifi" to ignored-packages, to allow this
 ```
 
+### Accepting a non-standard license declaration
+
+Some packages declare a license only as free text. `catboost`, for example, declares
+`License: Apache License, Version 2.0` with no SPDX identifier, no classifier, and no
+bundled license file. `trustedlicenses` flags it, suggests `Apache-2.0`, and does not
+trust the suggestion by default. To accept it, pin the exact statement you reviewed:
+
+```toml
+[tool.trustedlicenses.verified-packages]
+catboost = { statement = "Apache License, Version 2.0", spdx-id = "Apache-2.0" }
+```
+
+Unlike `ignored-packages`, which exempts a package by name whatever it declares
+later, a pin applies only while the declared statement still matches. If `catboost`
+later declares a different license, the pin stops applying and the package is checked
+against your policy again, so a strong-copyleft license fails unless your policy
+allows it. `verified-statements` does the same for one exact statement shared by
+several packages, and `trust-corrected-licenses = true` trusts every free-text
+correction project-wide. See the
+[Usage Guide](https://trustedlicenses.readthedocs.io/en/latest/usage/#free-text-correction-opt-in).
+
 ## Why not just read `pip list`'s license column?
 
 Most Python license tools ([`pip-licenses`](https://github.com/raimon49/pip-licenses),
@@ -248,7 +269,10 @@ read, so nothing to check.
 declared anything usable — actually reads the license *text* it ships and matches it
 against the official list of known open-source licenses. No extra software to
 install, and it doesn't need special system libraries the way some older tools in
-this space do. A plain check makes no network calls at all; `trustedlicenses
+this space do. The matcher is the [`spdx`](https://docs.rs/spdx) Rust crate (word-bigram
+Sørensen–Dice matching against the SPDX license list), the same family of approach as
+GitHub's [Licensee](https://github.com/licensee/licensee); `trustedlicenses` wraps it
+and does not reimplement it. A plain check makes no network calls at all; `trustedlicenses
 index-check` is a separate, opt-in command (see the
 [Usage Guide](https://trustedlicenses.readthedocs.io/en/latest/usage/#would-upgrading-help-opt-in-uses-the-network))
 for the rarer case where nothing usable is declared *or* bundled, and the fix is

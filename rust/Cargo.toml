@@ -1,6 +1,6 @@
 [package]
 name = "trustedlicenses_matcher"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 description = "Rust license-text matcher for trustedlicenses, wrapping the spdx crate's SPDX-corpus text detection"
 license = "MIT"

@@ -31,6 +31,15 @@ compatibility check; see
 [Usage Guide § Compatibility notes](usage.md#a-narrow-fsf-grounded-compatibility-check)
 for the rationale behind that narrower scope.
 
+Python floor: every release since 2026.0.0 (2026-06-12) requires Python 3.12 or
+later; the previous release, 2025.1.0 (2025-03-26), required 3.9 or later. When the
+floor changed, Python 3.10 and 3.11 were both still in security support (end of life
+2026-10-01 and 2027-10, per the [Python developer guide](https://devguide.python.org/versions/)),
+so projects on those versions could not move to the new releases. The commits, release
+notes and README give no reason for the change; the README states only that it uses
+Python 3.12 to 3.14. `trustedlicenses` aims to keep its own floor and ceiling aligned
+with the Python versions that are maintained at the time.
+
 `trustedlicenses`'s legal disclaimer is modeled on `licensecheck`'s — see the
 [README](https://github.com/w-martin/trustedlicenses#legal-disclaimer) for the full
 text.

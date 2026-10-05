@@ -35,7 +35,7 @@ from typing import TYPE_CHECKING, Any
 
 import tomlkit
 
-from trustedlicenses.detection import canonical_name, resolve_license_expression
+from trustedlicenses.detection import UNSTATED_CATEGORY, _category_table, canonical_name, resolve_license_expression
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, MutableMapping, Sequence
@@ -138,12 +138,10 @@ def load_policy(pyproject_path: Path | str = Path("pyproject.toml")) -> Policy:
 
     document: dict[str, Any] = {}
     if path.is_file():
-        with path.open("rb") as handle:
-            document = tomllib.load(handle)
+        document = _read_toml(path)
 
     if source == standalone_path:
-        with source.open("rb") as handle:
-            section = tomllib.load(handle)
+        section = _read_toml(source)
         section_source = standalone_path
     else:
         section = document
@@ -170,6 +168,16 @@ def load_policy(pyproject_path: Path | str = Path("pyproject.toml")) -> Policy:
         )
         raise ConfigError(message)
 
+    known_categories = set(_category_table().values()) - {UNSTATED_CATEGORY}
+    unknown = sorted(str(category) for category in allowed_categories if category not in known_categories)
+    if unknown:
+        message = (
+            f"{section_source}: unknown allowed-categories {', '.join(repr(name) for name in unknown)}. "
+            f"Known categories: {', '.join(sorted(known_categories))}.\n"
+            f"See {DOCS_URL} for the full category vocabulary."
+        )
+        raise ConfigError(message)
+
     ignored_packages = section.get("ignored-packages", [])
     return Policy(
         allowed_categories=frozenset(allowed_categories),
@@ -179,6 +187,16 @@ def load_policy(pyproject_path: Path | str = Path("pyproject.toml")) -> Policy:
         verified_packages=_verified_packages(section, section_source),
         verified_statements=_verified_statements(section, section_source),
     )
+
+
+def _read_toml(path: Path) -> dict[str, Any]:
+    """Parse a TOML file, turning a syntax error into a :class:`ConfigError` that names the file."""
+    try:
+        with path.open("rb") as handle:
+            return tomllib.load(handle)
+    except tomllib.TOMLDecodeError as error:
+        message = f"{path} is not valid TOML: {error}"
+        raise ConfigError(message) from error
 
 
 def _verified_packages(section: dict[str, Any], source: Path) -> dict[str, tuple[str, str]]:

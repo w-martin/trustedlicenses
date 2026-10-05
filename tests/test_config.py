@@ -89,6 +89,34 @@ def test_load_policy_raises_plain_config_error_when_allowed_categories_empty(tmp
     assert not isinstance(exc_info.value, NoPolicyConfiguredError)
 
 
+def test_load_policy_raises_config_error_naming_unknown_category(tmp_path: Path) -> None:
+    """A misspelt category is reported by name, with the known vocabulary."""
+    path = _write_pyproject(tmp_path, '[tool.trustedlicenses]\nallowed-categories = ["Permissive", "Permissiv"]\n')
+
+    with pytest.raises(ConfigError, match="unknown allowed-categories 'Permissiv'") as exc_info:
+        load_policy(path)
+    assert "Copyleft Limited" in str(exc_info.value)
+    assert "Unstated License" not in str(exc_info.value)
+
+
+def test_load_policy_raises_config_error_for_malformed_pyproject(tmp_path: Path) -> None:
+    """Invalid TOML in pyproject.toml is a ConfigError naming the file, not a raw decode error."""
+    path = _write_pyproject(tmp_path, '[tool.trustedlicenses]\nallowed-categories = ["Permissive"\n')
+
+    with pytest.raises(ConfigError, match="not valid TOML") as exc_info:
+        load_policy(path)
+    assert str(path) in str(exc_info.value)
+
+
+def test_load_policy_raises_config_error_for_malformed_standalone_file(tmp_path: Path) -> None:
+    """Invalid TOML in trustedlicenses.toml is a ConfigError naming that file."""
+    path = _write_pyproject(tmp_path, "[project]\nname = 'x'\n")
+    (tmp_path / "trustedlicenses.toml").write_text("allowed-categories = [\n", encoding="utf-8")
+
+    with pytest.raises(ConfigError, match=r"trustedlicenses\.toml is not valid TOML"):
+        load_policy(path)
+
+
 def test_load_policy_resolves_project_license_from_pep_639_string(tmp_path: Path) -> None:
     """[project.license] as a bare SPDX-expression string (PEP 639) resolves directly."""
     path = _write_pyproject(
