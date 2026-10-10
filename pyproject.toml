@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "trustedlicenses"
-version = "0.3.2"
+version = "0.3.3"
 description = "Policy-driven license auditing for installed Python dependencies, preferring declared package metadata and falling back to license-text matching."
 keywords = ["license", "compliance", "license-check", "spdx", "dependencies", "audit"]
 readme = "README.md"
@@ -23,6 +23,7 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
     "Topic :: Software Development :: Quality Assurance",
 ]
 dependencies = [
