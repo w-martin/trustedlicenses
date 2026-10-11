@@ -41,6 +41,7 @@ from packaging.utils import (
 )
 from packaging.version import InvalidVersion, Version
 
+from trustedlicenses._compat import override
 from trustedlicenses.detection import LICENCE_FILE_PATTERNS, resolve_license_expression
 from trustedlicenses.index_discovery import redact_url
 
@@ -105,6 +106,7 @@ class Client(Protocol):
 class _DropAuthOnCrossHostRedirect(urllib.request.HTTPRedirectHandler):
     """Follow redirects, but never forward credentials to a different host."""
 
+    @override
     def redirect_request(  # noqa: PLR0913, PLR0917 -- signature fixed by urllib
         self,
         req: urllib.request.Request,
@@ -249,6 +251,7 @@ class _LinkParser(HTMLParser):
         super().__init__()
         self.links: list[dict[str, str | None]] = []
 
+    @override
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         if tag == "a":
             self.links.append(dict(attrs))

@@ -8,7 +8,7 @@
 
 > ⚠️ **Project Status: Experimental**
 >
-> `trustedlicenses` (v0.3.3) is an early, experimental release. Detection, policy
+> `trustedlicenses` (v0.3.4) is an early, experimental release. Detection, policy
 > evaluation, and the CLI work end-to-end with full test coverage, but the API and
 > config format aren't stable yet, and license detection — declared-metadata parsing
 > and the Rust text-matching fallback alike — can be wrong. See the
@@ -174,7 +174,7 @@ hooks work. Add `trustedlicenses` as a dev dependency (see
 
 ```yaml
 - repo: https://github.com/w-martin/trustedlicenses
-  rev: v0.3.3
+  rev: v0.3.4
   hooks:
     - id: trustedlicenses
 ```
@@ -202,7 +202,7 @@ the Python path:
   run: pip install -r requirements.txt   # or uv sync, poetry install, ...
 
 - name: Check dependency licenses
-  uses: w-martin/trustedlicenses@v0.3.3
+  uses: w-martin/trustedlicenses@v0.3.4
 ```
 
 It accepts two optional inputs: `version` (pin the `trustedlicenses` release, as a
@@ -284,22 +284,22 @@ Toolkit in practice.
 
 ## Speed
 
-On a 425-package real-world environment (data science + web + cloud + ML stack, full
+On a 453-package real-world environment (data science + web + cloud + ML stack, full
 transitive dependency trees — see [Performance](https://trustedlicenses.readthedocs.io/en/latest/performance/)
 for exactly what's in it), `trustedlicenses` comes out fastest of the tools tested,
-despite doing genuine text-matching work for the ~23% of packages with no usable
+despite doing genuine text-matching work for the ~19% of packages with no usable
 declared metadata:
 
-| Tool | Median | Range |
-|---|---|---|
-| **`trustedlicenses`** | **1.29s** | 1.25s – 2.05s |
-| `pip-licenses` | 1.60s | 1.56s – 2.58s |
-| `licensecheck` | 2.13s | 2.08s – 9.30s |
-| `liccheck` | — | crashes on a current Python/setuptools combination |
+| Tool | Mean ± 1 SD (n=5) |
+|---|---|
+| **`trustedlicenses`** | **1.23 ± 0.02s** |
+| `pip-licenses` | 1.59 ± 0.01s |
+| `licensecheck` | 2.35 ± 0.59s |
+| `liccheck` | crashes on a current Python/setuptools combination |
 
-That speed isn't free or automatic: without releasing Python's GIL during each Rust
-text-matching scan and without running scans in parallel, the same fallback work
-takes **7.7–8.9s** on this same environment — roughly 6x slower. Instead, the
+That speed isn't free or automatic: run one package at a time instead of in
+parallel, the same detection work takes **7.6–7.8s** on this same environment —
+roughly 6x slower. Instead, the
 fallback scans run concurrently across a thread pool, and the underlying Rust
 matcher releases the GIL for the duration of each scan, so independent per-package
 work actually runs on multiple cores rather than serializing behind Python's

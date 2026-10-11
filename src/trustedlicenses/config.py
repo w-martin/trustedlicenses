@@ -281,21 +281,21 @@ def write_policy(
         document.add("allowed-categories", allowed)
         if ignored:
             document.add("ignored-packages", ignored)
-        target.write_text(tomlkit.dumps(document))
+        target.write_text(tomlkit.dumps(document), encoding="utf-8")
         return target
 
     if not path.is_file():
         message = f"{path} doesn't exist -- can't add a [tool.trustedlicenses] table to a file that isn't there."
         raise ConfigError(message)
 
-    document = tomlkit.parse(path.read_text())
+    document = tomlkit.parse(path.read_text(encoding="utf-8"))
     tool_table = document.setdefault("tool", tomlkit.table(is_super_table=True))
     section = tomlkit.table()
     section.add("allowed-categories", allowed)
     if ignored:
         section.add("ignored-packages", ignored)
     tool_table["trustedlicenses"] = section
-    path.write_text(tomlkit.dumps(document))
+    path.write_text(tomlkit.dumps(document), encoding="utf-8")
     return path
 
 
@@ -462,7 +462,7 @@ def add_to_policy(
             that package's new ``ignored-packages`` entry.
         trust: Free-text correction trust decisions to write, if any.
     """
-    document = tomlkit.parse(path.read_text())
+    document = tomlkit.parse(path.read_text(encoding="utf-8"))
     section = _policy_table(document, path)
 
     if allowed_categories:
@@ -477,4 +477,4 @@ def add_to_policy(
         if trust.verified_statements:
             _extend_verified_statements(section, trust.verified_statements)
 
-    path.write_text(tomlkit.dumps(document))
+    path.write_text(tomlkit.dumps(document), encoding="utf-8")

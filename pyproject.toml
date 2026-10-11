@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "trustedlicenses"
-version = "0.3.3"
+version = "0.3.4"
 description = "Policy-driven license auditing for installed Python dependencies, preferring declared package metadata and falling back to license-text matching."
 keywords = ["license", "compliance", "license-check", "spdx", "dependencies", "audit"]
 readme = "README.md"
@@ -101,6 +101,8 @@ ignore = [
 # way to declare a Typer flag, not something to route around.
 "src/trustedlicenses/cli.py" = ["FBT001", "FBT003"]
 "tasks.py" = ["T201"]
+# Standalone benchmark script, run directly rather than imported.
+"docs/benchmark/serial.py" = ["INP001", "T201"]
 
 [tool.ruff.lint.flake8-bugbear]
 # B008 normally flags a function call in an argument default (it usually means a

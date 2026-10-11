@@ -28,3 +28,4 @@ site/
 .claude/worktrees
 .worktrees
 .git/worktrees
+.bench/

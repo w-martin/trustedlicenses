@@ -36,7 +36,7 @@ Rust matcher. No system dependencies, no network calls, no rule-engine to instal
 
 See [Comparison to Alternatives](comparison.md) for how this stacks up against
 `pip-licenses`, `licensecheck`, `liccheck`, and ScanCode Toolkit-based tools, and
-[Performance](performance.md) for measured speed on a 425-package real-world
+[Performance](performance.md) for measured speed on a 453-package real-world
 environment.
 
 ## Installation
