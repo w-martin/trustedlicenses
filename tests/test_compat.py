@@ -19,11 +19,12 @@ def _restore_compat() -> typing.Iterator[None]:
 
 def test_override_on_python_312_plus_is_the_typing_one(monkeypatch: pytest.MonkeyPatch) -> None:
     """The 3.12+ branch re-exports ``typing.override`` itself."""
-    if sys.version_info < (3, 12):
+    if sys.version_info >= (3, 12):
+        monkeypatch.setattr(sys, "version_info", (3, 12, 0, "final", 0))
+        reloaded = importlib.reload(_compat)
+        assert reloaded.override is typing.override
+    else:
         pytest.skip("typing.override needs 3.12+")
-    monkeypatch.setattr(sys, "version_info", (3, 12, 0, "final", 0))
-    reloaded = importlib.reload(_compat)
-    assert reloaded.override is typing.override
 
 
 def test_override_shim_on_python_311_returns_the_method_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:

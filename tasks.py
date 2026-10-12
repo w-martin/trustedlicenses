@@ -5,6 +5,8 @@ from pathlib import Path
 from invoke import Context, task
 
 RUST_DIR = Path("rust")
+# CI lints on this version (the `requires-python` floor); the local venv is usually newer.
+PYTHON_FLOOR = "3.11"
 BINARY_PATH = RUST_DIR / "target" / "debug" / "librust_matcher.dylib"
 
 
@@ -46,9 +48,16 @@ def format_code(ctx: Context) -> None:
     ctx.run("ruff format .")
 
 
-@task
+@task(name="floor-check")
+def check_python_floor(ctx: Context) -> None:
+    """Type-check against the minimum supported Python, catching version-gating mistakes."""
+    ctx.run(f"ty check --python-version {PYTHON_FLOOR} .")
+    ctx.run(f"pyrefly check --python-version {PYTHON_FLOOR} .")
+
+
+@task(post=[check_python_floor])
 def lint(ctx: Context) -> None:
-    """Run all linters: ruff check, ty check, pyrefly check, cargo fmt, cargo clippy."""
+    """Run all linters: ruff check, ty check, pyrefly check, cargo fmt, cargo clippy, and the Python-floor check."""
     ctx.run("ruff check .")
     ctx.run("ty check .")
     ctx.run("pyrefly check .")

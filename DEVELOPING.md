@@ -36,7 +36,9 @@ All development tasks are managed via [Invoke](https://www.pyinvoke.org/). Run
   source has changed since the last build
 - `uv run inv format` -- run `ruff format`
 - `uv run inv lint` -- run `ruff check`, `ty check`, `pyrefly check`, `cargo fmt
-  --check`, and `cargo clippy`
+  --check`, and `cargo clippy`, then `floor-check`
+- `uv run inv floor-check` -- run `ty` and `pyrefly` at the minimum supported Python
+  (3.11), which CI uses; also run by the pre-commit hook
 - `uv run inv lint-fix` -- auto-fix with `ruff check --fix` and `ruff format`
 - `uv run inv test` -- build the Rust matcher if needed, then run pytest (with branch
   coverage) and `cargo test`

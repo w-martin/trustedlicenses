@@ -8,23 +8,30 @@ repos:
       - id: check-added-large-files
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.15.12
+    rev: v0.16.6
     hooks:
       - id: ruff-check
         args: [--fix]
       - id: ruff-format
 
   - repo: local
+    # PATH is extended because git GUI clients and IDEs run hooks without the shell profile.
     hooks:
+      - id: python-floor-check
+        name: Type-check at the Python floor
+        entry: bash -c 'export PATH="$HOME/.local/bin:$HOME/.cargo/bin:/opt/homebrew/bin:/opt/homebrew/opt/rustup/bin:$PATH"; uv run --frozen inv floor-check'
+        language: system
+        types: [python]
+        pass_filenames: false
       - id: cargo-fmt
         name: Rust format check
-        entry: bash -c 'cd rust && cargo fmt --all -- --check'
+        entry: bash -c 'export PATH="$HOME/.local/bin:$HOME/.cargo/bin:/opt/homebrew/bin:/opt/homebrew/opt/rustup/bin:$PATH"; cd rust && cargo fmt --all -- --check'
         language: system
         files: \.rs$
         pass_filenames: false
       - id: cargo-clippy
         name: Rust clippy
-        entry: bash -c 'cd rust && cargo clippy -- -D warnings'
+        entry: bash -c 'export PATH="$HOME/.local/bin:$HOME/.cargo/bin:/opt/homebrew/bin:/opt/homebrew/opt/rustup/bin:$PATH"; cd rust && cargo clippy -- -D warnings'
         language: system
         files: \.rs$
         pass_filenames: false
