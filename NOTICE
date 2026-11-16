@@ -20,7 +20,7 @@ the most authoritative source found for these terms.)
 ## The `spdx` Rust crate
 
 https://github.com/EmbarkStudios/spdx -- provides the text-detection engine this
-project's Rust matcher wraps (`rust/src/matcher.rs`), itself a maintained continuation
+project's Rust matcher wraps (`rust/core/src/matcher.rs`), itself a maintained continuation
 of askalono's (Copyright Amazon.com, Inc. or its affiliates) word-bigram
 Sorensen-Dice matching algorithm.
 
@@ -31,7 +31,7 @@ http://www.apache.org/licenses/LICENSE-2.0
 
 `rust/tests/fixtures/lgpl-3.0-short-form.txt` -- registered as an additional match
 template alongside the SPDX corpus's own long-form LGPL-3.0 text (see
-`rust/src/matcher.rs`) -- is copied verbatim from the FSF's own publication at
+`rust/core/src/matcher.rs`) -- is copied verbatim from the FSF's own publication at
 https://www.gnu.org/licenses/lgpl-3.0.txt.
 
 Copyright (C) 2007 Free Software Foundation, Inc. Verbatim copying and distribution
@@ -39,7 +39,7 @@ of this license document is permitted by its own terms.
 
 ## spdx-correct.js
 
-The *approach* behind `src/trustedlicenses/detection.py`'s `_correct_license_statement`
+The *approach* behind `rust/core/src/detection.rs`'s `correct_license_statement`
 (reformat punctuation/whitespace/a version number already present in a free-text
 license statement, then trust the result only once it validates as a real SPDX id) is
 adapted from the validated-transform tier of spdx-correct.js
@@ -54,7 +54,7 @@ http://www.apache.org/licenses/LICENSE-2.0
 ## ScanCode Toolkit license category data
 
 The SPDX-license-identifier -> category mapping bundled at
-`src/trustedlicenses/data/spdx_license_categories.json` (used to classify a detected
+`rust/core/data/spdx_license_categories.json` (used to classify a detected
 license as e.g. "Permissive" or "Copyleft") was extracted from ScanCode Toolkit's
 license database (https://github.com/aboutcode-org/scancode-toolkit,
 `licensedcode/data/licenses/`).

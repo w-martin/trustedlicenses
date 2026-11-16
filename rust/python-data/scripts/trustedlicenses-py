@@ -1,0 +1,6 @@
+#!python
+"""Run trustedlicenses in-process, for environments where an executable can't be started."""
+
+from trustedlicenses._binary import main_in_process
+
+main_in_process()

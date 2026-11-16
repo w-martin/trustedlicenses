@@ -1,54 +1,14 @@
-"""Policy-driven license auditing for installed Python dependencies."""
+"""trustedlicenses: policy-driven license auditing for Python dependencies.
 
-from trustedlicenses.config import (
-    ConfigError,
-    CorrectionTrust,
-    NoPolicyConfiguredError,
-    add_to_policy,
-    load_policy,
-    policy_source,
-    write_policy,
-)
-from trustedlicenses.detection import (
-    DistributionLicence,
-    canonical_name,
-    categories_for,
-    inspect_distribution,
-    inspect_installed,
-    resolve_license_expression,
-)
-from trustedlicenses.policy import (
-    Policy,
-    PolicyResult,
-    detect_all,
-    evaluate,
-    format_failure,
-    format_remediation,
-    format_suggestion,
-)
-from trustedlicenses.resolve import ResolutionError, resolve_packages
+The command line is a Rust program installed alongside this package; `python -m trustedlicenses` starts it,
+and `trustedlicenses-py` runs it inside the Python process. There is no Python API: see the usage guide.
+"""
 
-__all__ = [
-    "ConfigError",
-    "CorrectionTrust",
-    "DistributionLicence",
-    "NoPolicyConfiguredError",
-    "Policy",
-    "PolicyResult",
-    "ResolutionError",
-    "add_to_policy",
-    "canonical_name",
-    "categories_for",
-    "detect_all",
-    "evaluate",
-    "format_failure",
-    "format_remediation",
-    "format_suggestion",
-    "inspect_distribution",
-    "inspect_installed",
-    "load_policy",
-    "policy_source",
-    "resolve_license_expression",
-    "resolve_packages",
-    "write_policy",
-]
+from importlib.metadata import PackageNotFoundError, version
+
+try:
+    __version__ = version("trustedlicenses")
+except PackageNotFoundError:  # pragma: no cover -- only when run from a source tree that is not installed
+    __version__ = "0+unknown"
+
+__all__ = ["__version__"]

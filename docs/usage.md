@@ -12,9 +12,9 @@ or with pip:
 pip install trustedlicenses
 ```
 
-No system dependencies are required — the license-text matcher is a compiled Rust
-extension with the SPDX corpus baked in at build time, not something that loads data
-at runtime or shells out to another tool.
+No system dependencies are required — `trustedlicenses` is a compiled Rust program with
+the SPDX corpus baked in at build time, not something that loads data at runtime or
+shells out to another tool.
 
 ## Step 1 — Declare a policy
 
@@ -45,6 +45,28 @@ If both exist, the standalone file wins.
   on purpose: a project should state what it's willing to accept explicitly, rather
   than inherit an assumption. See [Policy § categories](#categories) below for the
   full vocabulary.
+- **`accepted-licenses`** (optional) — a table of package name to the SPDX ids accepted
+  for that package alone. A package whose categories aren't allowed still passes when a
+  license detected for it is listed:
+
+  ```toml
+  [tool.trustedlicenses.accepted-licenses]
+  certifi = ["MPL-2.0"]
+  ```
+
+  This is a decision about one license on one package, not the whole `Copyleft Limited`
+  category and not the package whatever it ships. It does not follow the package to a
+  different license: if `certifi` later detects as something else, it is checked against
+  `allowed-categories` again. Packages that pass this way are listed in the output
+  (`certifi: MPL-2.0 (accepted for this package in accepted-licenses)`). The failure
+  message gives the ready-to-paste line, and the guided review's `[l]` choice writes it.
+- **`allow-unlicensed`** (optional, default `false`; also `--allow-unlicensed`) — a package
+  that was read and has no license at all (no license file shipped and no license
+  statement declared) passes, and is listed as such. It never covers a license that was detected
+  but is disallowed, a license file or statement that couldn't be identified, a free-text
+  `License` statement awaiting review, or a package whose license couldn't be read (a git or local-path
+  dependency, a package missing from the index): those aren't "no license", and they
+  keep failing with their reason.
 - **`ignored-packages`** (optional) — canonical (PEP 503 normalised) names exempted
   from the check entirely, regardless of what they detect as. Use this for packages
   you've manually verified are fine despite failing automated detection (e.g. a
@@ -92,8 +114,8 @@ presented as a note to verify, never a verdict:
 
 This requires your own project to declare `[project.license]`; with nothing
 declared, no notes fire at all — a responsible note needs both sides. See
-`_compatibility_note` in
-[`policy.py`](https://github.com/w-martin/trustedlicenses/blob/main/src/trustedlicenses/policy.py)
+`compatibility_note` in
+[`policy.rs`](https://github.com/w-martin/trustedlicenses/blob/main/rust/core/src/policy.rs)
 for the exact logic, and a real example — a GPL-2.0-only project pulling in `scipy`
 (GPL-3.0-or-later) via `scikit-learn` — in the
 [README](https://github.com/w-martin/trustedlicenses#usage).
@@ -104,9 +126,10 @@ for the exact logic, and a real example — a GPL-2.0-only project pulling in `s
 uv run trustedlicenses
 ```
 
-This checks every distribution installed in the *current* Python environment —
-exactly what `importlib.metadata.distributions()` sees, the same interpreter you'd run
-your actual code with. It exits `0` if every checked package has an allowed license,
+This checks every distribution installed in the *current* Python environment — the
+same packages the interpreter you'd run your actual code with can import — or, if a
+lock file sits beside `pyproject.toml`, every package it pins (see
+[Auditing a lock file](#auditing-a-lock-file)). It exits `0` if every checked package has an allowed license,
 `1` otherwise (so it plugs directly into CI):
 
 ```shell
@@ -114,20 +137,33 @@ $ uv run trustedlicenses
 Checking dependency licenses...
 ✗ Disallowed or undetectable licenses in 2 of 134 packages:
   certifi: detected MPL-2.0 (categories: Copyleft Limited) -- from declared metadata
-    -> add "Copyleft Limited" to allowed-categories, or "certifi" to ignored-packages, to allow this
+    -> to accept only this license for this package, add `certifi = ["MPL-2.0"]` under [tool.trustedlicenses.accepted-licenses]; or add "Copyleft Limited" to allowed-categories to allow every package in it
   fqdn: detected MPL-2.0 (categories: Copyleft Limited) -- from license files: LICENSE
-    -> add "Copyleft Limited" to allowed-categories, or "fqdn" to ignored-packages, to allow this
+    -> to accept only this license for this package, add `fqdn = ["MPL-2.0"]` under [tool.trustedlicenses.accepted-licenses]; or add "Copyleft Limited" to allowed-categories to allow every package in it
 ```
 
 Each failure line is followed by a concrete suggestion — add the missing category to
-`allowed-categories`, or the package to `ignored-packages`, whichever fits. When
-nothing was detected at all, there's no category to suggest, so the suggestion points
-at manual verification instead:
+`allowed-categories`, or just this license for this package to `accepted-licenses`,
+whichever fits. When the package has no license at all (no license files, no declared
+statement), there's no category or license to suggest, so the suggestion points at manual
+verification and `allow-unlicensed`:
 
 ```
-  somepkg: no license detected -- from license files: LICENSE
-    -> no license could be detected; verify "somepkg" manually, then add it to
-       ignored-packages if acceptable
+  somepkg: no license detected -- from no license information found
+    -> no license could be detected; verify "somepkg" manually, then set
+       allow-unlicensed = true (or pass --allow-unlicensed) to allow packages that have none
+```
+
+When a license *is* declared or shipped but couldn't be identified (a proprietary license
+file, a free-text `License` field), `allow-unlicensed` doesn't apply, because there is a license
+to read. The suggestion says to read it, and to trust the package with `ignored-packages` if it
+is acceptable:
+
+```
+  closedpkg: no license detected -- from license files: LICENSE
+    -> a license is declared or shipped but could not be identified; read it yourself, then
+       trust "closedpkg" outright with ignored-packages if it is acceptable (allow-unlicensed
+       covers only packages with no license at all)
 ```
 
 When nothing was detected but a free-text `License` field looks like a real SPDX id
@@ -239,16 +275,120 @@ own — but pass `--quiet` explicitly so that stays true even if a step happens 
 a terminal attached (e.g. a local pre-commit run), rather than relying on the
 auto-detection alone.
 
+### Auditing a lock file
+
+A lock file pins every package your project resolves to, so it can be audited without
+installing anything — useful for a CI job that shouldn't have to build your whole
+environment first. `trustedlicenses` reads these formats:
+
+| File | Notes |
+|---|---|
+| `uv.lock` | Your own project and workspace members (`editable`/`virtual` entries) are skipped as local code. |
+| `pylock.toml` | [PEP 751](https://peps.python.org/pep-0751/). `pylock.<name>.toml` works with `--lock`. |
+| `poetry.lock` | A package with no `[package.source]` came from the default index. |
+| `Pipfile.lock` | Both `default` and `develop` sections. |
+| a requirements file | Only with `--lock FILE`, and every requirement must be pinned with `==`. `-r` includes are followed. Loose ranges can't be audited without a resolver, so they're an error that lists every offender, and a `requirements.txt` is never picked up automatically. |
+
+A lock file beside `pyproject.toml` is picked up automatically, in the order above. The
+flags that choose what is audited:
+
+| Flag | Effect |
+|---|---|
+| `--lock FILE` | Audit this lock or requirements file. |
+| `--installed` | Audit the installed environment even though a lock file is present. |
+| `--python EXE` | With `--installed`: query this interpreter's exact `sys.path`. |
+| `--venv DIR` | With `--installed`: scan this virtual environment without running Python. |
+| `--jobs N` | How many package lookups to run at once (default 16). Lower it for a shared or rate-limited index. |
+| `--offline` | Never use the network; read only what is already cached. |
+| `--no-cache` | Keep nothing from this run. |
+| `--prefer-installed` | Read a package from the installed environment when its name and version match the lock entry; use the index for the rest. For local and offline work. |
+| `--exclude-group NAME` | Leave out packages reached only through this dependency group or extra. Repeatable. See below. |
+
+**Where the licenses come from.** Each package's license metadata is read from the
+package index the lock file records for it (a package with no recorded index uses the
+[discovery rules](#would-upgrading-help-opt-in-uses-the-network) below: your project's
+configuration, then `UV_INDEX_URL`/`PIP_INDEX_URL`, then `pip.conf`, then pypi.org).
+On pypi.org the files of the one release are listed from its release document, which is
+a few kilobytes; any other index is asked for the project's standard listing. The small
+separate metadata file ([PEP 658](https://peps.python.org/pep-0658/)) is read first, and
+that is the end of it when the declared metadata already names a license. Otherwise the
+wheel's bundled license files are matched exactly as they would be for an installed
+package, reading only those entries with HTTP `Range` requests where the server allows
+(kilobytes, not the whole wheel), and downloading the wheel (up to 25 MB) where it doesn't.
+When a release has no wheel at all, its source distribution (`.tar.gz`, or `.zip`) is downloaded
+and its `PKG-INFO` is read; license files are taken from those `PKG-INFO` names, the top of the
+project and a top-level `licenses` directory, but not from vendored code deeper in the tree.
+Only package names and versions are sent;
+credentials come from your environment (`user:pass@` in the index URL, or `.netrc`) and
+are never forwarded to another host or printed.
+
+**Using the installed environment for local work.** `--prefer-installed` (with `--venv` or
+`--python` to choose the environment, otherwise the usual discovery) reads a package's
+license from the installed copy when its canonical name and version equal the lock entry's,
+and asks the index only for the rest. With `--offline` that makes a lock audit work with no
+network for whatever is installed. It is opt-in because it is weaker than the default: an
+installed copy is matched on name and version only, since a lock file's hashes are of the
+wheel or sdist archive and an installed environment doesn't keep that, so a patched or
+differently sourced copy at the same version would be trusted. Copies installed from a URL,
+VCS or path (they carry `direct_url.json`) are never used, only registry entries in the lock
+are eligible, and a failure from an installed copy is marked `[installed environment]`. Don't use it for
+the audit that gates a release.
+
+**Leaving out dev dependencies.** `--exclude-group dev` (repeat it for more) drops the packages
+that are reached only through that dependency group or optional extra, so a policy for what you
+ship need not cover your test tools. A package that is also reached some other way stays: a
+dev tool that is a runtime dependency of something else is still audited. The groups are read
+from the lock file:
+
+| File | Where the groups come from |
+|---|---|
+| `uv.lock` | The project's `dependencies`, `dev-dependencies` and `optional-dependencies`, followed through the dependency graph (including the extras of a dependency). |
+| `poetry.lock` | `groups` (Poetry 2), or `category` in older locks. |
+| `Pipfile.lock` | `default` is the runtime; `develop` is the group named `develop`. |
+| `pylock.toml` | Markers of the form `'dev' in dependency_groups`, `'x' in extras` and `extra == 'x'`. |
+
+A name that is not a group or extra in the lock is an error that lists the ones that are, `main`
+(the project's own dependencies) can't be excluded, and a requirements file or an installed
+environment records no groups, so the flag is refused for them. A package the lock says nothing
+about is never dropped.
+
+**Caching.** Results are cached per index under your platform's cache directory
+(`~/Library/Caches/trustedlicenses` on macOS, `$XDG_CACHE_HOME/trustedlicenses` or
+`~/.cache/trustedlicenses` on Linux, `%LOCALAPPDATA%\trustedlicenses` on Windows), or
+`TRUSTEDLICENSES_CACHE_DIR`. A repeat run needs no network, and a failed lookup leaves
+nothing behind. The text-matching results are cached too, so unchanged license files are not
+scanned again. A pinned release's metadata never changes, so there is nothing to
+expire.
+
+**It fails closed.** A package whose license can't be read is a failure with the
+reason, never a quiet pass:
+
+- a git, URL or local-path dependency has no index to ask;
+- a release published only as a source distribution is read from the archive itself (its
+  `PKG-INFO` and top-level license files, never executing anything), and fails with the reason
+  if that archive can't be read, is over 25 MB, or holds more than 64 license files (8 MB) or
+  a license file over 2 MB;
+- a package the index doesn't serve (an internal one on a different index) is "not found
+  on this index";
+- a wheel that must be downloaded whole for its license files, because the server can't
+  send part of a file, but is over 25 MB isn't downloaded.
+
+Review each. These are packages whose license couldn't be read, so `allow-unlicensed` doesn't
+apply to them; add one to `ignored-packages` only if you trust the package itself. On the benchmark
+environment on the [performance page](performance.md#auditing-a-lock-file), all 436
+packages got the same verdict from the lock file as from the installed environment.
+
 ### pre-commit
 
-`trustedlicenses` audits whatever's actually installed in the current Python
-environment, so the hook needs your project's own dependencies already installed —
+By default the hook audits whatever's actually installed in the current Python
+environment (it passes `--installed`, so it stays offline even when a lock file is
+present), so the hook needs your project's own dependencies already installed —
 not an isolated hook-specific environment the way most pre-commit hooks work. Add
 `trustedlicenses` as a dev dependency, then reference this repo directly:
 
 ```yaml
 - repo: https://github.com/w-martin/trustedlicenses
-  rev: v0.3.4
+  rev: v0.4.0
   hooks:
     - id: trustedlicenses
 ```
@@ -260,7 +400,7 @@ Or write the same thing as a local hook without depending on this repo's tag:
   hooks:
     - id: trustedlicenses
       name: trustedlicenses
-      entry: trustedlicenses --quiet
+      entry: trustedlicenses --quiet --installed
       language: system
       pass_filenames: false
 ```
@@ -276,11 +416,12 @@ the Python path:
   run: pip install -r requirements.txt   # or uv sync, poetry install, ...
 
 - name: Check dependency licenses
-  uses: w-martin/trustedlicenses@v0.3.4
+  uses: w-martin/trustedlicenses@v0.4.0
 ```
 
 It accepts two optional inputs: `version` (pin the `trustedlicenses` release, as a
-pip version specifier — defaults to latest) and `args` (defaults to `--quiet`). It
+pip version specifier — defaults to latest) and `args` (defaults to `--quiet --installed`, which audits the installed environment;
+pass `--quiet` alone to audit a lock file instead). It
 installs with `uv pip install` when `uv` is already on `PATH`, falling back to plain
 `pip install` otherwise.
 
@@ -323,7 +464,7 @@ Resolving requests and its transitive dependencies...
 Checking 5 package(s) (requested plus transitive dependencies)...
 ✗ Disallowed or undetectable licenses in 1 of 5 packages:
   certifi: detected MPL-2.0 (categories: Copyleft Limited) -- from declared metadata
-    -> add "Copyleft Limited" to allowed-categories, or "certifi" to ignored-packages, to allow this
+    -> to accept only this license for this package, add `certifi = ["MPL-2.0"]` under [tool.trustedlicenses.accepted-licenses]; or add "Copyleft Limited" to allowed-categories to allow every package in it
 ```
 
 `check` needs a policy to check the candidate against. If none is configured, it
@@ -374,24 +515,22 @@ declares a license file or a license the tool can resolve, so a wheel that bundl
 file without declaring it can be missed. Whether your other dependencies allow the
 upgrade is up to your resolver.
 
-## Embedding in code
+## Running where executables can't be started
 
-```python
-from trustedlicenses import load_policy, evaluate
+`trustedlicenses` is a native program with no Python API: the command line and its exit
+code are the interface. Some environments let the Python interpreter run code but kill or
+refuse other executables (for example, a host that terminates unsigned binaries). The wheel
+also carries the same command line as a Python extension module, and two entry points run it
+inside the interpreter's own process:
 
-policy = load_policy()  # reads ./pyproject.toml by default
-result = evaluate(policy)
-
-if not result.passed:
-    for failure in result.failures:
-        print(failure.name, failure.keys, failure.categories)
+```shell
+trustedlicenses-py --quiet                       # always in this process
+TRUSTEDLICENSES_INPROC=1 python -m trustedlicenses --quiet
 ```
 
-`evaluate()` also accepts an explicit `distributions_` iterable (overriding the
-default of every installed distribution), which is how the test suite exercises it
-against synthetic distributions rather than the real environment — and how `check`
-evaluates a package resolved into a temporary location. `detect_all()` runs the same
-detection with no policy applied, for report-only output.
+Both take exactly the arguments the executable does and give the same output and exit code.
+Plain `python -m trustedlicenses` starts the executable, replacing the Python process with it
+where the platform allows.
 
 ## How detection works
 
@@ -420,7 +559,7 @@ otherwise unambiguous once reformatted — PyPI's `catboost`, for example, ships
 `License: "Apache License, Version 2.0"` with no `License-Expression` field and no
 bundled `LICENSE` file for the text matcher to fall back on. A small set of
 deterministic, validated transforms (reformat punctuation and a version number
-*already present in the text* — see `_correct_license_statement` in `detection.py`)
+*already present in the text* — see `correct_license_statement` in `rust/core/src/detection.rs`)
 tries to turn text like that into a real SPDX id, accepting the result only once it's
 confirmed to be one. It never guesses a version or variant the text doesn't state —
 PEP 639's own appendix says tools "MUST NOT" auto-infer an SPDX id for exactly that
@@ -484,7 +623,7 @@ wordset/bigram approach has no equivalent segmentation, per its source, so it wo
 silently score such a file below threshold and report no match at all, rather than
 a wrong one. `trustedlicenses` uses the `spdx`/askalono lineage's `TopDown` scan
 mode specifically because it handles this correctly — see the module doc comment in
-[`matcher.rs`](https://github.com/w-martin/trustedlicenses/blob/main/rust/src/matcher.rs)
+[`matcher.rs`](https://github.com/w-martin/trustedlicenses/blob/main/rust/core/src/matcher.rs)
 for why the alternative `Elimination` scan mode is not used instead (it drops
 matches near the start of a document after a prior elimination pass).
 
@@ -514,8 +653,8 @@ against the corpus. At the library's own default of `0.9`, both are missed. At
 overriding its *library's* `0.9` default for evidently the same reason — both
 resolve correctly, without introducing false positives at nearby scores (`0.7`
 starts misidentifying BSD-3-Clause variants as the wrong license). See
-`TEXT_MATCH_CONFIDENCE_THRESHOLD` in
-[`detection.py`](https://github.com/w-martin/trustedlicenses/blob/main/src/trustedlicenses/detection.py).
+`DEFAULT_CONFIDENCE_THRESHOLD` in
+[`matcher.rs`](https://github.com/w-martin/trustedlicenses/blob/main/rust/core/src/matcher.rs).
 
 Any similarity-based text matcher — ours included — has a real, tunable
 false-negative/false-positive tradeoff. It is not a rule engine, and it will not be

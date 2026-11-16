@@ -1,7 +1,7 @@
 - id: trustedlicenses
   name: trustedlicenses
   description: Check installed Python dependency licenses against your project's allowed-categories policy.
-  entry: trustedlicenses --quiet
+  entry: trustedlicenses --quiet --installed
   language: system
   pass_filenames: false
   always_run: true

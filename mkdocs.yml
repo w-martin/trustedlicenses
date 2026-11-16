@@ -18,25 +18,9 @@ theme:
 
 plugins:
   - search
-  - mkdocstrings:
-      handlers:
-        python:
-          paths: [src]
-          options:
-            docstring_style: google
-            show_root_heading: true
-            show_category_heading: true
-            merge_init_into_class: true
 
 nav:
   - Home: index.md
   - Usage Guide: usage.md
   - Comparison to Alternatives: comparison.md
   - Performance: performance.md
-  - API Reference:
-    - Overview: api/index.md
-    - Detection: api/detection.md
-    - Policy: api/policy.md
-    - Config: api/config.md
-    - Resolve: api/resolve.md
-    - CLI: api/cli.md

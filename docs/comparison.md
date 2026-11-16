@@ -23,8 +23,10 @@ License field` — the same metadata-priority strategy `trustedlicenses` uses fo
 primary path, per its source
 ([`packageinforesolver.py`](https://github.com/FHPythonUtils/LicenseCheck)). No
 bundled-LICENSE-file text matching anywhere in its code. When a package isn't
-installed locally, it can fall back to the PyPI JSON API instead — not applicable to
-`trustedlicenses`'s installed-environment-only scope. Very actively maintained
+installed locally, it can fall back to the PyPI JSON API instead. `trustedlicenses`
+reads license metadata from a package index too, but only when auditing a lock file or
+on request (`index-check`), and from the index your project's own lock file or
+configuration names rather than assuming PyPI. Very actively maintained
 (releases every few days). It also has its own pairwise project-vs-dependency
 compatibility matrix — a materially bigger undertaking than `trustedlicenses`'s own
 compatibility check; see

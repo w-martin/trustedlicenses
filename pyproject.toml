@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "trustedlicenses"
-version = "0.3.4"
+version = "0.4.0"
 description = "Policy-driven license auditing for installed Python dependencies, preferring declared package metadata and falling back to license-text matching."
 keywords = ["license", "compliance", "license-check", "spdx", "dependencies", "audit"]
 readme = "README.md"
@@ -26,32 +26,37 @@ classifiers = [
     "Programming Language :: Python :: 3.15",
     "Topic :: Software Development :: Quality Assurance",
 ]
-dependencies = [
-    "typer>=0.27.2",
-    "tomlkit>=0.15.1",
-    "packaging>=24.2",
-]
+dependencies = []
 
 [project.urls]
 Homepage = "https://github.com/w-martin/trustedlicenses"
 Repository = "https://github.com/w-martin/trustedlicenses"
 "Issue Tracker" = "https://github.com/w-martin/trustedlicenses/issues"
 
-[project.scripts]
-trustedlicenses = "trustedlicenses.cli:app"
-
 [tool.maturin]
-manifest-path = "rust/Cargo.toml"
+# The wheel carries the Rust `trustedlicenses` executable (installed as a script) next to the Python package.
+manifest-path = "rust/cli/Cargo.toml"
 python-source = "src"
-module-name = "trustedlicenses.rust_matcher"
-features = ["pyo3/extension-module"]
-# The wheel auto-bundles LICENSE/NOTICE (both live at the repo root, outside the
-# rust/ crate dir maturin's sdist packaging otherwise looks at) -- but its sdist
-# doesn't, a known maturin gap for this layout. PKG-INFO still claims them as
-# License-File entries either way, so an sdist missing them is a real PyPI upload
-# rejection (400: "License-File LICENSE does not exist in distribution file"),
-# not just a cosmetic omission.
+bindings = "bin"
+module-name = "trustedlicenses"
+# `trustedlicenses-py`: a Python script installed beside the executable, which maturin cannot declare as an entry point.
+data = "rust/python-data"
+# The extension module is built on its own and staged into the package (see `tasks.py` and the publish
+# workflow), because a `bindings = "bin"` build cannot produce it.
+#
+# LICENSE/NOTICE live at the repo root, outside the rust/ crate dir maturin's sdist packaging looks at, and
+# maturin's sdist doesn't bundle them. PKG-INFO still claims them as License-File entries, so an sdist
+# missing them is a real PyPI upload rejection (400: "License-File LICENSE does not exist in distribution
+# file"). The fixtures are read by `include_str!` from outside the crates.
 include = [
+    { path = "src/trustedlicenses/_rust.*", format = "wheel" },
+    { path = "rust/Cargo.toml", format = "sdist" },
+    { path = "rust/Cargo.lock", format = "sdist" },
+    { path = "rust/core/**/*", format = "sdist" },
+    { path = "rust/cli/**/*", format = "sdist" },
+    { path = "rust/python/**/*", format = "sdist" },
+    { path = "rust/python-data/**/*", format = "sdist" },
+    { path = "rust/tests/fixtures/*", format = "sdist" },
     { path = "LICENSE", format = "sdist" },
     { path = "NOTICE", format = "sdist" },
 ]
@@ -90,26 +95,9 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["S101", "SLF001"]
-# Small fakes and local-server handlers in tests don't need per-method docstrings.
-"tests/test_index.py" = ["D102", "D107"]
-# Verbatim canonical license text used as a test fixture (sourced from the `spdx`
-# crate's own bundled SPDX corpus) -- FSF's GPL-2.0 paragraphs run well past 120
-# columns; rewrapping them would mean the fixture is no longer the actual text.
-"tests/conftest.py" = ["E501"]
-# FBT001/FBT003: Typer's own API puts a bare bool default (e.g. `typer.Option(False,
-# "--quiet", ...)`) in the option's own positional signature -- that's the documented
-# way to declare a Typer flag, not something to route around.
-"src/trustedlicenses/cli.py" = ["FBT001", "FBT003"]
 "tasks.py" = ["T201"]
-# Standalone benchmark script, run directly rather than imported.
-"docs/benchmark/serial.py" = ["INP001", "T201"]
-
-[tool.ruff.lint.flake8-bugbear]
-# B008 normally flags a function call in an argument default (it usually means a
-# mutable default evaluated once at import time) -- but `typer.Option(...)` /
-# `typer.Argument(...)` calls in a parameter default are Typer's own documented way
-# to declare CLI options/arguments, and are safe (immutable per-call) by design.
-extend-immutable-calls = ["typer.Option", "typer.Argument"]
+# Standalone CI helper, run directly rather than imported.
+"scripts/check_wheel.py" = ["INP001"]
 
 [tool.ruff.lint.mccabe]
 max-complexity = 10
@@ -129,7 +117,6 @@ search-path = [".", "src"]
 [dependency-groups]
 docs = [
     "mkdocs-material>=9.7.7",
-    "mkdocstrings-python>=2.0.5",
 ]
 dev = [
     "invoke>=2.2.1",

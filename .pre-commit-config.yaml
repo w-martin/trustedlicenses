@@ -31,7 +31,7 @@ repos:
         pass_filenames: false
       - id: cargo-clippy
         name: Rust clippy
-        entry: bash -c 'export PATH="$HOME/.local/bin:$HOME/.cargo/bin:/opt/homebrew/bin:/opt/homebrew/opt/rustup/bin:$PATH"; cd rust && cargo clippy -- -D warnings'
+        entry: bash -c 'export PATH="$HOME/.local/bin:$HOME/.cargo/bin:/opt/homebrew/bin:/opt/homebrew/opt/rustup/bin:$PATH"; cd rust && cargo clippy --workspace -- -D warnings'
         language: system
         files: \.rs$
         pass_filenames: false

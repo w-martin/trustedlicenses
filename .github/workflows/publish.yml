@@ -3,10 +3,13 @@ name: Publish
 on:
   push:
     tags: [ 'v*' ]
+  # A manual run dry-runs the static executables only (the wheel and publish jobs need a tag).
+  workflow_dispatch:
 
 jobs:
   verify-version:
     name: Verify tag matches pyproject.toml version
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -24,6 +27,7 @@ jobs:
   build_wheels:
     name: Build wheels (${{ matrix.target }})
     needs: [ verify-version ]
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -32,6 +36,9 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
+            # jemalloc fixes its page size when it is built; 64 KiB also covers aarch64 kernels
+            # with larger pages. Ruff builds its aarch64 wheels the same way (astral-sh/ruff#3791).
+            docker_options: -e JEMALLOC_SYS_WITH_LG_PAGE=16
           - os: windows-latest
             target: x86_64-pc-windows-msvc
           - os: macos-latest
@@ -42,20 +49,135 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The wheel is built with `bindings = "bin"`, which cannot build the extension module. It is
+      # built on its own and staged into the package, where the wheel's `include` picks it up.
+      - name: Build the extension module
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out ../../extension-dist
+          working-directory: rust/python
+          manylinux: auto
+          docker-options: ${{ matrix.docker_options }}
+
+      - name: Stage the extension module
+        shell: python
+        run: |
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          for wheel_path in Path("extension-dist").glob("*.whl"):
+              with ZipFile(wheel_path) as wheel:
+                  for member in wheel.namelist():
+                      name = Path(member).name
+                      if name.startswith("_rust.") and Path(name).suffix in {".so", ".pyd"}:
+                          Path("src/trustedlicenses", name).write_bytes(wheel.read(member))
+
       - uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist
+          args: --profile cli --out dist
           manylinux: auto
+          docker-options: ${{ matrix.docker_options }}
+
+      # Loading is what fails when an extension is linked wrongly, not the file being absent. Only on
+      # runners that can run the target.
+      - name: Check the wheel
+        if: contains(fromJSON('["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "aarch64-apple-darwin"]'), matrix.target)
+        shell: bash
+        run: python scripts/check_wheel.py dist
 
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-${{ matrix.target }}
           path: dist/*.whl
 
+  # Static musl executables for containers and hosts without Python. Not gated on verify-version so a
+  # manual dispatch can dry-run it; on a tag, `publish` still depends on verify-version via build_wheels.
+  build_static_binaries:
+    name: Static binary (${{ matrix.target }})
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+          - target: aarch64-unknown-linux-musl
+            # Same jemalloc page-size pin as the aarch64 wheel.
+            jemalloc_page: "16"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install zig and cargo-zigbuild
+        run: pip install cargo-zigbuild ziglang
+
+      - name: Add the target
+        run: rustup target add ${{ matrix.target }}
+
+      # Set only when the matrix gives a value: an empty JEMALLOC_SYS_WITH_LG_PAGE reaches configure as
+      # `--with-lg-page=` and jemalloc then fails to compile.
+      - name: Build
+        run: |
+          if [ -n "${{ matrix.jemalloc_page }}" ]; then
+            export JEMALLOC_SYS_WITH_LG_PAGE=${{ matrix.jemalloc_page }}
+          fi
+          cargo zigbuild --profile cli --target ${{ matrix.target }} --bin trustedlicenses
+        working-directory: rust
+
+      - name: Check the executable is static
+        run: |
+          BIN=rust/target/${{ matrix.target }}/cli/trustedlicenses
+          file "$BIN"
+          if readelf -l "$BIN" | grep -q INTERP || readelf -d "$BIN" | grep -q NEEDED; then
+            echo "::error::$BIN links dynamically"
+            exit 1
+          fi
+
+      # An installed environment with one MIT package, and a policy that allows it: needs no Python.
+      - name: Run it on a fixture
+        run: |
+          BIN="$PWD/rust/target/${{ matrix.target }}/cli/trustedlicenses"
+          DIST=check-project/env/lib/python3.99/site-packages/demo-1.0.dist-info
+          mkdir -p "$DIST"
+          printf 'Name: demo\nVersion: 1.0\nLicense-Expression: MIT\n' > "$DIST/METADATA"
+          printf '[tool.trustedlicenses]\nallowed-categories = ["Permissive"]\n' > check-project/pyproject.toml
+          ARGS="--pyproject check-project/pyproject.toml --quiet --installed --venv check-project/env"
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
+            sudo apt-get update && sudo apt-get install -y qemu-user-static
+            qemu-aarch64-static "$BIN" $ARGS | tee out.txt
+          else
+            "$BIN" $ARGS | tee out.txt
+          fi
+          grep -q "All 1 packages passed." out.txt
+
+      - name: Package
+        run: |
+          NAME="trustedlicenses-${{ matrix.target }}"
+          mkdir -p "release-assets/$NAME"
+          cp rust/target/${{ matrix.target }}/cli/trustedlicenses LICENSE "release-assets/$NAME/"
+          tar -C release-assets -czf "release-assets/$NAME.tar.gz" "$NAME"
+          rm -r "release-assets/$NAME"
+          (cd release-assets && sha256sum "$NAME.tar.gz" > "$NAME.tar.gz.sha256")
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4.2.2
+        with:
+          subject-path: release-assets/*.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: static-${{ matrix.target }}
+          path: release-assets/*
+
   build_sdist:
     name: Build sdist
     needs: [ verify-version ]
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -65,29 +187,49 @@ jobs:
           command: sdist
           args: --out dist
 
+      # A source build needs the whole workspace, the files `include_str!` reads from outside the
+      # crates, and the data directory that holds `trustedlicenses-py`.
+      - name: Check the sdist holds what a source build needs
+        run: |
+          python - <<'PY'
+          import tarfile
+          from pathlib import Path
+
+          names = tarfile.open(next(Path("dist").glob("*.tar.gz"))).getnames()
+          required = [
+              "LICENSE", "NOTICE", "rust/Cargo.toml", "rust/Cargo.lock", "rust/core/Cargo.toml",
+              "rust/cli/Cargo.toml", "rust/python/Cargo.toml", "rust/python-data/scripts/trustedlicenses-py",
+              "rust/tests/fixtures/mit.txt", "rust/core/data/spdx_license_categories.json",
+          ]
+          missing = [r for r in required if not any(n.endswith("/" + r) for n in names)]
+          assert not missing, f"sdist is missing {missing}"
+          PY
+
       - uses: actions/upload-artifact@v4
         with:
           name: sdist
           path: dist/*.tar.gz
 
   publish:
-    needs: [ build_wheels, build_sdist ]
+    needs: [ build_wheels, build_sdist, build_static_binaries ]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
       id-token: write
       contents: write
     steps:
+      # Kept apart from dist/: the PyPI action uploads everything in it, and a binary tarball is not an sdist.
       - uses: actions/download-artifact@v4
         with:
-          pattern: wheels-*
           path: dist
+          pattern: "{wheels-*,sdist}"
           merge-multiple: true
 
       - uses: actions/download-artifact@v4
         with:
-          name: sdist
-          path: dist
+          path: release-assets
+          pattern: static-*
+          merge-multiple: true
 
       - uses: pypa/gh-action-pypi-publish@release/v1
 
@@ -95,7 +237,10 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          files: dist/*
+          files: |
+            dist/*.whl
+            dist/*.tar.gz
+            release-assets/*
 
   test-published:
     needs: [ publish ]
@@ -124,5 +269,11 @@ jobs:
             sleep 30
           done
 
-      - name: Smoke test the installed CLI
-        run: trustedlicenses --help
+      # The executable, the in-process script, and `python -m` both ways: the installed wheel is what users get.
+      - name: Smoke test every way of starting it
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          trustedlicenses --version | grep -q "$VERSION"
+          trustedlicenses-py --version | grep -q "$VERSION"
+          python -m trustedlicenses --version | grep -q "$VERSION"
+          TRUSTEDLICENSES_INPROC=1 python -m trustedlicenses --version | grep -q "$VERSION"

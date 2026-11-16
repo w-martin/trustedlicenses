@@ -1,7 +1,8 @@
 # trustedlicenses
 
-`trustedlicenses` checks that every package installed in your Python project has a
-license you've agreed to allow, so you can gate a CI build on it.
+`trustedlicenses` checks that every package in your Python project — installed, or
+pinned in a lock file — has a license you've agreed to allow, so you can gate a CI build
+on it.
 
 ```toml
 # pyproject.toml
@@ -15,9 +16,9 @@ $ uv run trustedlicenses
 Checking dependency licenses...
 ✗ Disallowed or undetectable licenses in 2 of 134 packages:
   certifi: detected MPL-2.0 (categories: Copyleft Limited) -- from declared metadata
-    -> add "Copyleft Limited" to allowed-categories, or "certifi" to ignored-packages, to allow this
+    -> to accept only this license for this package, add `certifi = ["MPL-2.0"]` under [tool.trustedlicenses.accepted-licenses]; or add "Copyleft Limited" to allowed-categories to allow every package in it
   fqdn: detected MPL-2.0 (categories: Copyleft Limited) -- from license files: LICENSE
-    -> add "Copyleft Limited" to allowed-categories, or "fqdn" to ignored-packages, to allow this
+    -> to accept only this license for this package, add `fqdn = ["MPL-2.0"]` under [tool.trustedlicenses.accepted-licenses]; or add "Copyleft Limited" to allowed-categories to allow every package in it
 ```
 
 ## Why not just read `pip list`'s license column?
@@ -32,11 +33,13 @@ a meaningful slice of installed packages either predate
 declared anything usable — falls back to matching the actual license *text* it
 bundles in its `.dist-info` directory against the official SPDX
 [license-list-data](https://github.com/spdx/license-list-data) corpus, via a small
-Rust matcher. No system dependencies, no network calls, no rule-engine to install.
+Rust matcher. No system dependencies and no rule-engine to install; checking an
+installed environment makes no network calls (auditing a lock file reads license
+metadata from the package index).
 
 See [Comparison to Alternatives](comparison.md) for how this stacks up against
 `pip-licenses`, `licensecheck`, `liccheck`, and ScanCode Toolkit-based tools, and
-[Performance](performance.md) for measured speed on a 453-package real-world
+[Performance](performance.md) for measured speed on a 436-package real-world
 environment.
 
 ## Installation
@@ -51,8 +54,3 @@ uv add --dev trustedlicenses
 detected licenses, categories, and policy pass/fail — is a best-effort technical
 signal, not a legal opinion. See the [README](https://github.com/w-martin/trustedlicenses#legal-disclaimer)
 for the full disclaimer before relying on it for a compliance decision.
-
-## API Reference
-
-Browse the [API Reference](api/index.md) for full documentation of all public classes
-and functions.

@@ -8,14 +8,14 @@ branding:
 inputs:
   version:
     description: >
-      trustedlicenses version to install, as a pip version specifier (e.g. "0.3.4"
+      trustedlicenses version to install, as a pip version specifier (e.g. "0.4.0"
       or ">=0.3,<0.4"). Defaults to the latest release on PyPI.
     required: false
     default: ''
   args:
     description: Arguments passed to the trustedlicenses CLI.
     required: false
-    default: '--quiet'
+    default: '--quiet --installed'
 
 runs:
   using: composite

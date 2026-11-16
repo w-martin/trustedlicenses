@@ -1,0 +1,47 @@
+[package]
+name = "trustedlicenses-cli"
+version = "0.4.0"
+edition = "2021"
+description = "Command-line interface of trustedlicenses"
+license = "MIT"
+repository = "https://github.com/w-martin/trustedlicenses"
+homepage = "https://github.com/w-martin/trustedlicenses"
+
+[lib]
+name = "trustedlicenses_cli"
+
+[[bin]]
+name = "trustedlicenses"
+path = "src/main.rs"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+unwrap_used = "warn"
+
+[dependencies]
+trustedlicenses-core = { path = "../core" }
+clap = { version = "4", features = ["derive"] }
+rayon = "1"
+tempfile = "3"
+
+[dev-dependencies]
+serde_json = "1"
+
+[features]
+# Build with the platform's allocator, to compare it against jemalloc/mimalloc on the same machine:
+# `cargo build --profile cli --features system-allocator`.
+system-allocator = []
+
+# jemalloc on Linux (including static musl builds, whose platform malloc is slow under many threads),
+# mimalloc on Windows. macOS keeps the platform allocator: measured there, jemalloc was no faster on
+# this workload and used ~20 MB more memory. Keep the `cfg`s in `src/lib.rs` in step with these.
+[target.'cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "powerpc64", target_arch = "riscv64")))'.dependencies]
+# No initial-exec TLS: that model fails to `dlopen` into a process that did not link jemalloc at start
+# (the extension module).
+tikv-jemallocator = { version = "0.7", features = ["disable_initial_exec_tls"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+mimalloc = { version = "0.1.52", default-features = false }
