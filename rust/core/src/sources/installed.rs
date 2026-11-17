@@ -201,9 +201,15 @@ fn pth_directories(site_packages: &Path) -> Vec<PathBuf> {
 /// exact answer.
 #[must_use]
 pub fn venv_search_paths(venv: &Path) -> Vec<PathBuf> {
+    // Compared by resolved path: on Linux `lib64` is usually a symlink to `lib`, and the same
+    // directory scanned twice would report every package twice.
+    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    let mut fresh =
+        |path: &Path| seen.insert(fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()));
+
     let mut site_dirs: Vec<PathBuf> = Vec::new();
     let windows = venv.join("Lib").join("site-packages");
-    if windows.is_dir() {
+    if windows.is_dir() && fresh(&windows) {
         site_dirs.push(windows);
     }
     for lib in ["lib", "lib64"] {
@@ -221,7 +227,7 @@ pub fn venv_search_paths(venv: &Path) -> Vec<PathBuf> {
         pythons.sort();
         for python in pythons {
             let site = python.join("site-packages");
-            if site.is_dir() && !site_dirs.contains(&site) {
+            if site.is_dir() && fresh(&site) {
                 site_dirs.push(site);
             }
         }
@@ -230,7 +236,7 @@ pub fn venv_search_paths(venv: &Path) -> Vec<PathBuf> {
     for site in site_dirs {
         let extra = pth_directories(&site);
         paths.push(site);
-        paths.extend(extra);
+        paths.extend(extra.into_iter().filter(|dir| fresh(dir)));
     }
     paths
 }
@@ -455,5 +461,29 @@ mod tests {
             let actual: Vec<(&str, &str)> = metadata.iter().collect();
             assert_eq!(&actual, expected, "for {text:?}");
         }
+    }
+
+    /// A Linux virtual environment has `lib64` as a symlink to `lib`.
+    #[cfg(unix)]
+    #[test]
+    fn a_lib64_symlink_to_lib_does_not_list_site_packages_twice() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let site = tmp.path().join("lib/python3.12/site-packages");
+        std::fs::create_dir_all(&site).expect("mkdir");
+        std::os::unix::fs::symlink("lib", tmp.path().join("lib64")).expect("symlink");
+        let paths = venv_search_paths(tmp.path());
+        assert_eq!(paths, [site]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_pth_directory_already_listed_is_not_listed_again() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let site = tmp.path().join("lib/python3.12/site-packages");
+        std::fs::create_dir_all(site.join("extra")).expect("mkdir");
+        std::fs::write(site.join("one.pth"), "extra\n").expect("write");
+        std::fs::write(site.join("two.pth"), "extra\n").expect("write");
+        let paths = venv_search_paths(tmp.path());
+        assert_eq!(paths, [site.clone(), site.join("extra")]);
     }
 }

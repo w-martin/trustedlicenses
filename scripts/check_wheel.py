@@ -77,10 +77,13 @@ def main(dist: Path) -> None:
         in_process = {**base, IN_PROCESS: "1"}
         entry_points = {
             "executable": ([str(bin_dir / f"trustedlicenses{exe}")], base),
-            "trustedlicenses-py": ([str(bin_dir / f"trustedlicenses-py{exe}")], base),
             "python -m": ([str(python), "-m", "trustedlicenses"], base),
             "python -m, in process": ([str(python), "-m", "trustedlicenses"], in_process),
         }
+        # pip makes a launcher for entry points but copies a wheel's data scripts as they are, so on
+        # Windows `trustedlicenses-py` has no executable to start by name; `python -m` covers that path.
+        if sys.platform != "win32":
+            entry_points["trustedlicenses-py"] = ([str(bin_dir / "trustedlicenses-py")], base)
         check = ["--pyproject", str(pyproject), "--quiet", "--installed", "--venv", str(environment)]
         for label, (command, env) in entry_points.items():
             if version not in _run([*command, "--version"], env=env):

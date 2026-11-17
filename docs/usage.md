@@ -529,6 +529,8 @@ TRUSTEDLICENSES_INPROC=1 python -m trustedlicenses --quiet
 ```
 
 Both take exactly the arguments the executable does and give the same output and exit code.
+On Windows, use the second form: pip installs a wheel's script files as they are and only
+makes a launcher for entry points, so `trustedlicenses-py` can't be started by name there.
 Plain `python -m trustedlicenses` starts the executable, replacing the Python process with it
 where the platform allows.
 

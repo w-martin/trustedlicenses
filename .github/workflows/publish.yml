@@ -34,7 +34,9 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-          - os: ubuntu-latest
+          # Built natively on an arm64 runner: the cross compiler in the manylinux2014 cross image cannot
+          # assemble `ring` (a TLS dependency of the index client).
+          - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             # jemalloc fixes its page size when it is built; 64 KiB also covers aarch64 kernels
             # with larger pages. Ruff builds its aarch64 wheels the same way (astral-sh/ruff#3791).
@@ -83,7 +85,7 @@ jobs:
       # Loading is what fails when an extension is linked wrongly, not the file being absent. Only on
       # runners that can run the target.
       - name: Check the wheel
-        if: contains(fromJSON('["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "aarch64-apple-darwin"]'), matrix.target)
+        if: contains(fromJSON('["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "aarch64-apple-darwin"]'), matrix.target)
         shell: bash
         run: python scripts/check_wheel.py dist
 
@@ -148,8 +150,8 @@ jobs:
           printf '[tool.trustedlicenses]\nallowed-categories = ["Permissive"]\n' > check-project/pyproject.toml
           ARGS="--pyproject check-project/pyproject.toml --quiet --installed --venv check-project/env"
           if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
-            sudo apt-get update && sudo apt-get install -y qemu-user-static
-            qemu-aarch64-static "$BIN" $ARGS | tee out.txt
+            sudo apt-get update && sudo apt-get install -y qemu-user
+            qemu-aarch64 "$BIN" $ARGS | tee out.txt
           else
             "$BIN" $ARGS | tee out.txt
           fi
