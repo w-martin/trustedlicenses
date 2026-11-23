@@ -10,6 +10,7 @@ Each PYTHON gets a clean virtual environment of its own; without any, the interp
 """
 
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -44,7 +45,9 @@ def _check_contents(wheel: Path) -> None:
     if not any(name.startswith("trustedlicenses/_rust.") and name.endswith(EXTENSION_SUFFIXES) for name in names):
         _fail("the wheel has no trustedlicenses._rust extension module")
     # Free-threaded 3.15+ loads only this build; Windows names it like the abi3 one, so it has abi3 alone.
-    if "-win" not in wheel.name and "trustedlicenses/_rust.abi3t.so" not in names:
+    # maturin 1.16+ adds the platform for a 3.15+ stable ABI (`_rust.abi3t-x86_64-linux-gnu.so`).
+    abi3t = re.compile(r"trustedlicenses/_rust\.abi3t(-[\w-]+)?\.so")
+    if "-win" not in wheel.name and not any(abi3t.fullmatch(name) for name in names):
         _fail("the wheel has no abi3t extension module, which free-threaded Python needs")
 
 
