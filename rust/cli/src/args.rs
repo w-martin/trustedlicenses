@@ -62,6 +62,17 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub no_cache: bool,
 
+    /// PEM file of extra CA certificates to trust for the package index (e.g. a private CA),
+    /// alongside the bundled Mozilla roots. Without this, SSL_CERT_FILE, PIP_CERT, `cert` in
+    /// pip.conf, then REQUESTS_CA_BUNDLE are used, whichever is set first.
+    #[arg(long, global = true, value_name = "FILE")]
+    pub ca_cert: Option<PathBuf>,
+
+    /// Trust the operating system's certificate store instead of the bundled Mozilla roots, e.g.
+    /// for a corporate CA installed in the macOS keychain or Windows store.
+    #[arg(long, global = true, conflicts_with = "ca_cert")]
+    pub system_certs: bool,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -81,5 +92,23 @@ pub enum Command {
     IndexCheck {
         /// Package to look up, e.g. webencodings.
         package: String,
+    },
+    /// Replace allowed-categories with the specific licenses they allow in this project today.
+    ///
+    /// Stricter, for publishing: afterwards a license new to the project fails until you
+    /// accept it, instead of passing because it shares a category.
+    Pin {
+        /// Show what would be written, without writing it.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Write a Markdown report of the policy for whoever reviews it: what's accepted and
+    /// why, and what could be accepted but isn't.
+    ///
+    /// Always exits 0 when the report is written: it describes the policy, it doesn't gate.
+    Report {
+        /// Write the report to this file instead of standard output.
+        #[arg(long, short, value_name = "FILE")]
+        output: Option<PathBuf>,
     },
 }

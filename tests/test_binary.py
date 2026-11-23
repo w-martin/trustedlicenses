@@ -132,6 +132,41 @@ def test_extension_reports_a_missing_module(monkeypatch: pytest.MonkeyPatch) -> 
         _binary._extension()
 
 
+def test_extension_explains_an_interpreter_that_cannot_load_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    """On an interpreter the extension is not built for, the error says so instead of suggesting a reinstall."""
+
+    def missing(_name: str) -> object:
+        raise ImportError
+
+    monkeypatch.setattr(_binary, "import_module", missing)
+    monkeypatch.setattr(_binary, "_unsupported_interpreter", lambda **_kwargs: "it is free-threaded")
+
+    with pytest.raises(BinaryNotFoundError, match=r"unavailable: it is free-threaded\. Run the trustedlicenses ex"):
+        _binary._extension()
+
+
+@pytest.mark.parametrize(
+    ("free_threaded", "version", "platform", "supported"),
+    [
+        (False, (3, 11), "linux", True),
+        (False, (3, 15), "win32", True),
+        (True, (3, 15), "linux", True),
+        (True, (3, 15), "darwin", True),
+        (True, (3, 14), "linux", False),
+        (True, (3, 15), "win32", False),
+    ],
+)
+def test_unsupported_interpreter(
+    *, free_threaded: bool, version: tuple[int, int], platform: str, supported: bool
+) -> None:
+    """Free-threaded Python gets the abi3t build, which needs 3.15 and is not shipped for Windows."""
+    reason = _binary._unsupported_interpreter(free_threaded=free_threaded, version=version, platform=platform)
+
+    assert (reason is None) is supported
+    if not supported:
+        assert f"{version[0]}.{version[1]} on {platform}" in str(reason)
+
+
 def test_extension_returns_the_module(monkeypatch: pytest.MonkeyPatch) -> None:
     """The extension is imported by its full name."""
     fake = _FakeExtension()
@@ -203,6 +238,17 @@ def test_run_binary_starts_the_executable_otherwise(tmp_path: Path, monkeypatch:
 
     assert (result.returncode, result.stdout.strip()) == (4, "a b")
     assert isinstance(result, subprocess.CompletedProcess)
+
+
+def test_run_binary_decodes_captured_output_as_utf8(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The executable writes UTF-8, whatever the locale's encoding."""
+    script = tmp_path / "trustedlicenses"
+    script.write_text(f"#!{sys.executable}\nimport sys\nsys.stdout.buffer.write('Ünïcödé ✓'.encode())\n")
+    script.chmod(0o755)
+    monkeypatch.setattr(_binary, "_in_process", lambda: False)
+    monkeypatch.setattr(_binary, "find_binary", lambda: script)
+
+    assert _binary.run_binary([], capture=True).stdout == "Ünïcödé ✓"
 
 
 def test_main_replaces_the_process_with_the_executable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -4,6 +4,10 @@ The in-process mode runs the same command line from the `trustedlicenses._rust` 
 for environments where the Python interpreter may run code but no other executable may be started.
 """
 
+# PEP 810 (3.15+; inert before): only Windows, in-process capture and a missing executable use these, and
+# `python -m trustedlicenses` otherwise replaces itself with the executable without them.
+__lazy_modules__ = ["shutil", "subprocess"]
+
 import os
 import shutil
 import subprocess
@@ -50,19 +54,44 @@ def _requested_in_process() -> bool:
     return os.environ.get(IN_PROCESS_VARIABLE, "").strip().lower() not in _OFF_VALUES
 
 
+def _unsupported_interpreter(*, free_threaded: bool, version: tuple[int, int], platform: str) -> str | None:
+    """Why an interpreter cannot load the extension even when it is installed, if it cannot.
+
+    Free-threaded Python loads only the abi3t build (PEP 803), which starts at 3.15 and which Windows cannot
+    ship beside the abi3 one: both are named `_rust.pyd` there.
+    """
+    if free_threaded and (version < (3, 15) or platform == "win32"):
+        return (
+            f"free-threaded Python {version[0]}.{version[1]} on {platform} cannot load it; it needs "
+            "free-threaded Python 3.15 or later on Linux or macOS, or a Python that is not free-threaded"
+        )
+    return None
+
+
 def _extension() -> ModuleType:
     """The `trustedlicenses._rust` extension module.
 
     Raises:
-        BinaryNotFoundError: If the package was installed without it.
+        BinaryNotFoundError: If the package was installed without it, or this interpreter cannot load it.
     """
     try:
         return import_module("trustedlicenses._rust")
     except ImportError as e:
-        msg = (
-            "The trustedlicenses extension module (trustedlicenses._rust) was not found. "
-            "Reinstall trustedlicenses from a wheel, or build it from source with: uv run inv build"
+        reason = _unsupported_interpreter(
+            free_threaded=bool(get_config_var("Py_GIL_DISABLED")),
+            version=sys.version_info[:2],
+            platform=sys.platform,
         )
+        if reason is not None:
+            msg = (
+                f"The trustedlicenses extension module (trustedlicenses._rust) is unavailable: {reason}. "
+                f"Run the trustedlicenses executable instead, without {IN_PROCESS_VARIABLE}."
+            )
+        else:
+            msg = (
+                "The trustedlicenses extension module (trustedlicenses._rust) was not found. "
+                "Reinstall trustedlicenses from a wheel, or build it from source with: uv run inv build"
+            )
         raise BinaryNotFoundError(msg) from e
 
 
@@ -100,7 +129,8 @@ def run_binary(arguments: list[str], *, capture: bool = False) -> subprocess.Com
             return subprocess.CompletedProcess(args=arguments, returncode=status, stdout=stdout, stderr=stderr)
         return subprocess.CompletedProcess(args=arguments, returncode=extension.main(["trustedlicenses", *arguments]))
     command = [str(find_binary()), *arguments]
-    return subprocess.run(command, capture_output=capture, text=True, check=False)  # noqa: S603 -- our own executable
+    # The command line writes UTF-8; before 3.15 (PEP 686) text mode would decode with the locale's encoding.
+    return subprocess.run(command, capture_output=capture, encoding="utf-8", check=False)  # noqa: S603 -- our own executable
 
 
 def main() -> None:

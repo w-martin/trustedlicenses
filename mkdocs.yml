@@ -21,6 +21,8 @@ plugins:
 
 nav:
   - Home: index.md
+  - Choosing a Policy: choosing-a-policy.md
   - Usage Guide: usage.md
+  - How It Works: how-it-works.md
   - Comparison to Alternatives: comparison.md
   - Performance: performance.md

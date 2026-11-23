@@ -241,13 +241,28 @@ pub fn venv_search_paths(venv: &Path) -> Vec<PathBuf> {
     paths
 }
 
+/// The interpreter to start. The child runs in the temp directory, where a relative path such as
+/// `.venv/bin/python` would otherwise be looked up; a bare name is left for the `PATH` search.
+fn program_path(python: &Path) -> std::io::Result<PathBuf> {
+    if python
+        .parent()
+        .is_some_and(|dir| !dir.as_os_str().is_empty())
+    {
+        std::path::absolute(python)
+    } else {
+        Ok(python.to_path_buf())
+    }
+}
+
 /// Ask an interpreter for its `sys.path`, keeping only absolute entries that exist.
 ///
 /// # Errors
 ///
 /// When the interpreter cannot be run or its output is not the expected JSON.
 pub fn query_sys_path(python: &Path) -> Result<Vec<PathBuf>, SourceError> {
-    let output = Command::new(python)
+    let program = program_path(python)
+        .map_err(|error| source_error(format!("could not run {}: {error}", python.display())))?;
+    let output = Command::new(program)
         .args(["-c", "import json, sys; print(json.dumps(sys.path))"])
         .current_dir(std::env::temp_dir())
         .output()
@@ -328,6 +343,45 @@ pub fn resolve_environment(
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn a_bare_interpreter_name_is_left_for_the_path_search() {
+        assert_eq!(
+            program_path(Path::new("python3")).expect("path"),
+            Path::new("python3")
+        );
+    }
+
+    #[test]
+    fn a_relative_interpreter_path_is_made_absolute() {
+        let program = program_path(Path::new("venv/bin/python")).expect("path");
+        assert!(program.is_absolute());
+        assert!(program.ends_with("venv/bin/python"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_relative_interpreter_path_runs_from_the_current_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Relative to the test's working directory, the crate's, which the child process does not share.
+        let tmp = tempfile::Builder::new()
+            .prefix(".query-sys-path-")
+            .tempdir_in(".")
+            .expect("tempdir");
+        let python = tmp.path().join("python");
+        std::fs::write(&python, "#!/bin/sh\necho '[\"/\"]'\n").expect("write");
+        std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let relative = python
+            .strip_prefix(std::env::current_dir().expect("cwd"))
+            .map_or(python.clone(), Path::to_path_buf);
+        assert!(relative.is_relative());
+
+        assert_eq!(
+            query_sys_path(&relative).expect("sys.path"),
+            vec![PathBuf::from("/")]
+        );
+    }
 
     #[test]
     fn parses_simple_headers_and_stops_at_the_body() {

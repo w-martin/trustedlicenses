@@ -4,14 +4,15 @@ Loading is what fails when an extension module is linked or stripped wrongly, no
 so this runs the executable, `trustedlicenses-py`, `python -m trustedlicenses` and the in-process mode,
 not merely listing the wheel's contents. Standard library only, so any CI runner can run it.
 
-Usage: python scripts/check_wheel.py [DIST_DIR]
+Usage: python scripts/check_wheel.py [DIST_DIR [PYTHON ...]]
+
+Each PYTHON gets a clean virtual environment of its own; without any, the interpreter running this does.
 """
 
 import os
 import subprocess
 import sys
 import tempfile
-import venv
 from pathlib import Path
 from zipfile import ZipFile
 
@@ -42,6 +43,9 @@ def _check_contents(wheel: Path) -> None:
         _fail(f"the wheel has no trustedlicenses-py script (scripts: {sorted(scripts)})")
     if not any(name.startswith("trustedlicenses/_rust.") and name.endswith(EXTENSION_SUFFIXES) for name in names):
         _fail("the wheel has no trustedlicenses._rust extension module")
+    # Free-threaded 3.15+ loads only this build; Windows names it like the abi3 one, so it has abi3 alone.
+    if "-win" not in wheel.name and "trustedlicenses/_rust.abi3t.so" not in names:
+        _fail("the wheel has no abi3t extension module, which free-threaded Python needs")
 
 
 def _fixture_environment(root: Path) -> tuple[Path, Path]:
@@ -55,18 +59,11 @@ def _fixture_environment(root: Path) -> tuple[Path, Path]:
     return root / "env", project / "pyproject.toml"
 
 
-def main(dist: Path) -> None:
-    """Check the wheel in `dist`."""
-    wheels = sorted(dist.glob("*.whl"))
-    if len(wheels) != 1:
-        _fail(f"expected exactly one wheel in {dist}, found {[wheel.name for wheel in wheels]}")
-    wheel = wheels[0]
-    version = wheel.name.split("-")[1]
-    _check_contents(wheel)
-
+def _check_under(wheel: Path, version: str, interpreter: str) -> None:
+    """Install `wheel` into a clean virtual environment of `interpreter` and start it every way."""
     with tempfile.TemporaryDirectory(prefix="check-wheel-") as scratch:
         root = Path(scratch)
-        venv.create(root / "venv", with_pip=True)
+        _run([interpreter, "-m", "venv", str(root / "venv")])
         bin_dir = root / "venv" / ("Scripts" if sys.platform == "win32" else "bin")
         exe = ".exe" if sys.platform == "win32" else ""
         python = bin_dir / f"python{exe}"
@@ -90,8 +87,20 @@ def main(dist: Path) -> None:
                 _fail(f"{label}: --version does not report {version}")
             if "All 1 packages passed." not in _run([*command, *check], env=env):
                 _fail(f"{label}: the fixture check did not pass")
+
+
+def main(dist: Path, interpreters: list[str]) -> None:
+    """Check the wheel in `dist` under each of `interpreters`."""
+    wheels = sorted(dist.glob("*.whl"))
+    if len(wheels) != 1:
+        _fail(f"expected exactly one wheel in {dist}, found {[wheel.name for wheel in wheels]}")
+    wheel = wheels[0]
+    version = wheel.name.split("-")[1]
+    _check_contents(wheel)
+    for interpreter in interpreters:
+        _check_under(wheel, version, interpreter)
     print(f"check_wheel: {wheel.name} OK")  # noqa: T201
 
 
 if __name__ == "__main__":
-    main(Path(sys.argv[1]) if len(sys.argv) > 1 else Path("dist"))
+    main(Path(sys.argv[1]) if len(sys.argv) > 1 else Path("dist"), sys.argv[2:] or [sys.executable])

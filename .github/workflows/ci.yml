@@ -81,3 +81,16 @@ jobs:
 
       - name: Check the wheel
         run: uv run inv check-wheel
+
+      # The newest Python, and its free-threaded build, which loads the abi3t extension (not on Windows).
+      - name: Check the wheel on Python 3.15
+        shell: bash
+        run: |
+          VERSIONS="3.15"
+          if [ "$RUNNER_OS" != "Windows" ]; then VERSIONS="$VERSIONS 3.15t"; fi
+          ARGS=()
+          for VERSION in $VERSIONS; do
+            uv python install "$VERSION"
+            ARGS+=(--python "$(uv python find --no-project "$VERSION")")
+          done
+          uv run inv check-wheel "${ARGS[@]}"

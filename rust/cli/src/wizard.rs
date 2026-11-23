@@ -17,11 +17,13 @@ use crate::context::{Color, Style};
 use crate::prompt::{timeout_notice, PromptError, Prompter};
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use trustedlicenses_core::config::{add_to_policy, write_policy, CorrectionTrust, PolicyAdditions};
+use trustedlicenses_core::config::{
+    add_to_policy, write_new_policy, CorrectionTrust, NewPolicy, PolicyAdditions, UseCase,
+};
 use trustedlicenses_core::detection::{categories_for, DistributionLicence};
 use trustedlicenses_core::index::{audit_package, format_audit, AuditOptions, Client};
 use trustedlicenses_core::index_discovery::{discover_index, redact_url, DiscoveryContext};
-use trustedlicenses_core::policy::{format_failure, Policy, PolicyResult};
+use trustedlicenses_core::policy::{format_failure, pin_licenses, Policy, PolicyResult};
 
 /// What a wizard needs from the outside world beyond the terminal.
 pub struct Services<'a> {
@@ -101,18 +103,79 @@ const PRIMARY_CATEGORIES: [(&str, &str, bool); 4] = [
     ),
     (
         "Copyleft Limited",
-        "LGPL, MPL-2.0, ... -- changes to the licensed code itself must be shared back, but you can still \
-         use it inside a project under a different license (e.g. dynamic linking is fine). Doesn't \
-         require your whole project to adopt the same license.",
+        "LGPL, MPL-2.0, ... -- changes to the licensed code must be shared with anyone you \
+         distribute it to; the rest of your project can keep its own license. A few licenses here \
+         (RPL, APSL, EUPL, ...) also count internal or network use, so check any you see.",
         true,
     ),
     (
         "Copyleft",
         "GPL, AGPL, ... -- a much bigger commitment: distributing a work that includes this code \
-         generally requires your entire project to also be released under a compatible copyleft license.",
+         generally requires the combined work to be distributed under that license, so your own \
+         code needs a compatible one.",
         false,
     ),
 ];
+
+const COPYLEFT: &str = "Copyleft";
+const SOURCE_AVAILABLE: &str = "Source-available";
+
+/// Whether the code leaves the organisation, and how, decides what a copyleft license asks
+/// of it; the categories themselves can't tell. Pre-wrapped: `echo` doesn't wrap, and a
+/// terminal breaks mid-word.
+fn copyleft_hint(use_case: UseCase) -> &'static [&'static str] {
+    match use_case {
+        UseCase::Internal => &[
+            "For internal use: GPL has no conditions while the code stays in your organisation;",
+            "AGPL does if you modify it and people use it over a network. Others here (OSL,",
+            "Parity, ...) are triggered by use, so answer n and accept GPL packages one at a",
+            "time in the review after the check.",
+        ],
+        UseCase::OpenSource => &[
+            "For an open-source package: fine if your own project is GPL. Declare your license",
+            "in pyproject.toml ([project.license]) and the check flags GPL version mismatches.",
+        ],
+        UseCase::Product => &[
+            "For a product: shipping copies brings in GPL's full terms; hosting only doesn't,",
+            "but AGPL does if you modify it. Answer n and accept individual packages in the",
+            "review after the check.",
+        ],
+    }
+}
+
+/// Up to this many licenses are named when offering to pin; the rest are counted.
+const NAME_PINNED_UP_TO: usize = 8;
+
+fn abbreviated(licenses: &BTreeSet<String>) -> String {
+    let named = licenses
+        .iter()
+        .take(NAME_PINNED_UP_TO)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    match licenses.len().saturating_sub(NAME_PINNED_UP_TO) {
+        0 => named,
+        rest => format!("{named} and {rest} more"),
+    }
+}
+
+/// No default: the answer changes what is suggested, so it has to be the user's.
+fn ask_use_case(io: &mut dyn Prompter) -> Result<UseCase, PromptError> {
+    io.echo("What are you building?");
+    io.echo("  [i] internal tooling or pipelines -- nothing leaves your organisation");
+    io.echo("  [o] an open-source package or tool others install (e.g. from PyPI)");
+    io.echo("  [p] a product you ship to customers or host for them");
+    io.echo("  Not sure, or it may ship later? Choose p.");
+    loop {
+        let answer = io.prompt("Choice (i/o/p)", "")?;
+        match answer.trim().to_lowercase().chars().next() {
+            Some('i') => return Ok(UseCase::Internal),
+            Some('o') => return Ok(UseCase::OpenSource),
+            Some('p') => return Ok(UseCase::Product),
+            _ => io.echo("  Type i, o or p (not sure? p)."),
+        }
+    }
+}
 
 /// Above this many matches in one category, list a count only: naming every package stops
 /// being skimmable.
@@ -180,6 +243,8 @@ struct ReviewDecisions {
     accepted: Vec<(String, Vec<String>)>,
     allow_unlicensed: bool,
     allowed_categories: BTreeSet<String>,
+    /// For a pinned policy: licenses to allow for every package.
+    allowed_licenses: BTreeSet<String>,
     verified_packages: Vec<(String, (String, String))>,
     verified_statements: Vec<(String, String)>,
     trust_corrected_licenses: bool,
@@ -198,6 +263,7 @@ impl ReviewDecisions {
             && self.accepted.is_empty()
             && !self.allow_unlicensed
             && self.allowed_categories.is_empty()
+            && self.allowed_licenses.is_empty()
             && self.verified_packages.is_empty()
             && self.verified_statements.is_empty()
             && !self.trust_corrected_licenses)
@@ -224,7 +290,7 @@ fn civil_date(days: i64) -> String {
 }
 
 /// Today's UTC date, for the "accepted <date>" reason on a new ignored-packages entry.
-fn today_utc() -> String {
+pub(crate) fn today_utc() -> String {
     let seconds = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs());
@@ -248,7 +314,9 @@ fn primary_suggestion(failure: &DistributionLicence) -> Option<&(String, String)
     failure.suggested.iter().next()
 }
 
-fn failure_options(failure: &DistributionLicence) -> String {
+/// `pinned`: the policy names licenses, not categories, so offering a category would undo
+/// the pin; offer the license instead.
+fn failure_options(failure: &DistributionLicence, pinned: bool) -> String {
     let mut options = Vec::new();
     if !failure.keys.is_empty() {
         let licenses = failure.keys.iter().cloned().collect::<Vec<_>>().join(", ");
@@ -264,9 +332,15 @@ fn failure_options(failure: &DistributionLicence) -> String {
     options.push(format!(
         "[{IGNORE}]gnore this package (trusts the package, whatever its license)"
     ));
-    if failure.categories.is_empty() {
+    if failure.keys.is_empty() {
         options.push(format!(
             "[{BULK_IGNORE}]ulk-ignore every remaining undetectable package"
+        ));
+    } else if pinned || failure.categories.is_empty() {
+        // No category to allow (a `WITH` license, an unknown id), or one that would undo a pin.
+        let licenses = failure.keys.iter().cloned().collect::<Vec<_>>().join(", ");
+        options.push(format!(
+            "[{ALLOW_CATEGORY}]dd {licenses} to allowed-licenses (every package with it, not just this one)"
         ));
     } else {
         let categories = failure
@@ -304,6 +378,7 @@ fn apply_choice(
     failure: &DistributionLicence,
     today: &str,
     decisions: &mut ReviewDecisions,
+    pinned: bool,
 ) -> (bool, bool) {
     if choice == QUIT {
         return (true, false);
@@ -331,7 +406,14 @@ fn apply_choice(
             failure.name.clone(),
             reason_for(failure, today),
         );
-    } else if choice == ALLOW_CATEGORY && !failure.categories.is_empty() {
+    } else if choice == ALLOW_CATEGORY
+        && (pinned || failure.categories.is_empty())
+        && !failure.keys.is_empty()
+    {
+        decisions
+            .allowed_licenses
+            .extend(failure.keys.iter().cloned());
+    } else if choice == ALLOW_CATEGORY && !pinned && !failure.categories.is_empty() {
         decisions
             .allowed_categories
             .extend(failure.categories.iter().cloned());
@@ -382,6 +464,11 @@ fn summarize_and_write(
     for category in &decisions.allowed_categories {
         io.echo(&format!("  allow category \"{category}\""));
     }
+    for license in &decisions.allowed_licenses {
+        io.echo(&format!(
+            "  allow {license} for every package (allowed-licenses)"
+        ));
+    }
     if decisions.allow_unlicensed {
         io.echo("  allow packages that have no license (allow-unlicensed = true)");
     }
@@ -422,6 +509,7 @@ fn summarize_and_write(
             .map(|(name, _)| name.clone())
             .collect(),
         allowed_categories: decisions.allowed_categories.iter().cloned().collect(),
+        allowed_licenses: decisions.allowed_licenses.iter().cloned().collect(),
         accepted_licenses: decisions
             .accepted
             .iter()
@@ -462,7 +550,8 @@ fn would_pass_if_corrected(failure: &DistributionLicence, policy: &Policy) -> bo
         .iter()
         .map(|(_, id)| id.as_str())
         .collect();
-    !categories_for(ids).is_disjoint(&policy.allowed_categories)
+    ids.iter().any(|id| policy.allowed_licenses.contains(*id))
+        || !categories_for(ids).is_disjoint(&policy.allowed_categories)
 }
 
 fn offer_blanket_correction(
@@ -561,10 +650,11 @@ fn ask_choice(
     services: &Services<'_>,
     failure: &DistributionLicence,
     project_dir: &Path,
+    pinned: bool,
 ) -> Result<String, PromptError> {
     loop {
         io.echo(&format!("\n{}", format_failure(failure)));
-        io.echo(&failure_options(failure));
+        io.echo(&failure_options(failure, pinned));
         let choice = io.prompt("  Choice", SKIP)?.trim().to_lowercase();
         if choice != CHECK_INDEX || !failure.keys.is_empty() {
             return Ok(choice);
@@ -602,10 +692,17 @@ impl InteractiveWizard {
             return Ok(None);
         }
         io.echo("");
+        let use_case = ask_use_case(io)?;
+        io.echo("");
 
         let mut allowed: Vec<String> = Vec::new();
         for (category, explanation, default) in PRIMARY_CATEGORIES {
             io.echo(&format!("{category}: {explanation}"));
+            if category == COPYLEFT {
+                for line in copyleft_hint(use_case) {
+                    io.echo(&format!("  {line}"));
+                }
+            }
             let already: BTreeSet<String> = allowed.iter().cloned().collect();
             io.echo(&format!(
                 "  {}",
@@ -637,6 +734,17 @@ impl InteractiveWizard {
                 .collect::<Vec<_>>()
                 .join(", ");
             io.echo(&format!("Also detected in your environment: {listed}."));
+            if other_categories
+                .iter()
+                .any(|c| c.as_str() == SOURCE_AVAILABLE)
+            {
+                io.echo(
+                    "Source-available licenses vary: some (BUSL, CC-BY-NC) restrict use even \
+                     internally, others (SSPL, Elastic) restrict offering the software to others as \
+                     a service. Read the terms, then leave this blank and accept the package in the \
+                     review after the check.",
+                );
+            }
             let extra = io.prompt(
                 "Allow any of these too? Comma-separated exact names, or Enter to skip",
                 "",
@@ -658,6 +766,24 @@ impl InteractiveWizard {
             &format!("\nAllowed categories: {}", allowed.join(", ")),
             Style::bold(Color::Green),
         );
+        let pinnable = pin_licenses(
+            detected,
+            &Policy {
+                allowed_categories: allowed.iter().cloned().collect(),
+                ..Policy::default()
+            },
+        );
+        let pin = !pinnable.is_empty() && {
+            io.echo(&format!(
+                "\nThese categories allow {} license(s) in your environment now: {}.",
+                pinnable.len(),
+                abbreviated(&pinnable)
+            ));
+            io.echo("  Pinned, the policy lists exactly these, so a license new to the project");
+            io.echo("  fails until you accept it: stricter, for publishing. Keeping categories is");
+            io.echo("  easier while developing; `trustedlicenses pin` can pin later.");
+            io.confirm("Pin to these licenses instead of the categories?", false)?
+        };
 
         let standalone = if pyproject.is_file() {
             io.confirm(
@@ -678,7 +804,17 @@ impl InteractiveWizard {
         if !io.confirm("\nWrite this configuration?", true)? {
             return Ok(None);
         }
-        match write_policy(pyproject, &allowed, &[], standalone) {
+        let written = write_new_policy(
+            pyproject,
+            &NewPolicy {
+                allowed_categories: &allowed,
+                pinned_licenses: pin.then_some(&pinnable),
+                ignored_packages: &[],
+                use_case: Some(use_case),
+            },
+            standalone,
+        );
+        match written {
             Ok(written) => {
                 io.secho(
                     &format!("\nWrote policy to {}.", written.display()),
@@ -722,9 +858,10 @@ impl InteractiveWizard {
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
 
+        let pinned = policy.allowed_categories.is_empty();
         let mut bulk_ignore_undetectable = false;
         for failure in &remaining {
-            if bulk_ignore_undetectable && failure.categories.is_empty() {
+            if bulk_ignore_undetectable && failure.keys.is_empty() {
                 set_ordered(
                     &mut decisions.ignored,
                     failure.name.clone(),
@@ -735,8 +872,8 @@ impl InteractiveWizard {
             if decisions.allow_unlicensed && failure.is_unlicensed() {
                 continue;
             }
-            let choice = ask_choice(io, services, failure, project_dir)?;
-            let (quit, bulk) = apply_choice(io, &choice, failure, &today, &mut decisions);
+            let choice = ask_choice(io, services, failure, project_dir, pinned)?;
+            let (quit, bulk) = apply_choice(io, &choice, failure, &today, &mut decisions, pinned);
             bulk_ignore_undetectable = bulk_ignore_undetectable || bulk;
             if quit {
                 break;

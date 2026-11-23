@@ -1,6 +1,6 @@
 [package]
 name = "trustedlicenses-core"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 description = "Pure-Rust core of trustedlicenses: license detection and policy evaluation"
 license = "MIT"
@@ -24,6 +24,10 @@ serde_json = "1"
 toml = "1.2.0"
 toml_edit = "0.25.18"
 ureq = { version = "3", features = ["platform-verifier"] }
+# ureq's own TLS stack, named directly to recognise its errors and to pair a private CA with the
+# Mozilla roots ureq otherwise bundles.
+rustls = { version = "0.23", default-features = false }
+webpki-root-certs = "1"
 pep440_rs = "0.7.3"
 zip = { version = "9", default-features = false, features = ["deflate"] }
 url = "2.5.8"
@@ -35,3 +39,4 @@ tar = "0.4.46"
 
 [dev-dependencies]
 tempfile = "3"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }

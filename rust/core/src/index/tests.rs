@@ -1572,3 +1572,81 @@ fn a_reuse_style_licenses_directory_in_an_sdist_is_matched() {
         BTreeSet::from(["MIT".to_owned()])
     );
 }
+
+const TLS_CA: &str = include_str!("../../../tests/fixtures/tls/ca.pem");
+const TLS_SERVER_CERT: &str = include_str!("../../../tests/fixtures/tls/server.pem");
+const TLS_SERVER_KEY: &str = include_str!("../../../tests/fixtures/tls/server.key");
+const TLS_INDEX_PAGE: &str = "<a href=\"pkg-1.0.tar.gz\">pkg-1.0.tar.gz</a>";
+
+/// An HTTPS index whose certificate is signed by the fixture CA, not by a public root.
+fn private_ca_index() -> u16 {
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use std::io::Read;
+
+    let certs = CertificateDer::pem_slice_iter(TLS_SERVER_CERT.as_bytes())
+        .collect::<Result<Vec<_>, _>>()
+        .expect("server certificate");
+    let key = PrivateKeyDer::from_pem_slice(TLS_SERVER_KEY.as_bytes()).expect("server key");
+    let config = Arc::new(
+        rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("protocol versions")
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .expect("server config"),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let config = Arc::clone(&config);
+            thread::spawn(move || {
+                let Ok(connection) = rustls::ServerConnection::new(config) else {
+                    return;
+                };
+                let mut tls = rustls::StreamOwned::new(connection, stream);
+                let mut request = Vec::new();
+                let mut chunk = [0_u8; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    match tls.read(&mut chunk) {
+                        Ok(0) | Err(_) => return,
+                        Ok(read) => request.extend_from_slice(&chunk[..read]),
+                    }
+                }
+                let _ = write!(
+                    tls,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\
+                     Connection: close\r\n\r\n{TLS_INDEX_PAGE}",
+                    TLS_INDEX_PAGE.len()
+                );
+                tls.conn.send_close_notify();
+                let _ = tls.flush();
+            });
+        }
+    });
+    port
+}
+
+#[test]
+fn a_private_ca_index_is_trusted_only_with_its_ca_bundle() {
+    let url = format!("https://127.0.0.1:{}/simple/pkg/", private_ca_index());
+    let mut client = client();
+
+    let refused = client.get(&url, None, None).expect_err("untrusted CA");
+    let message = refused.to_string();
+    assert!(message.starts_with("TLS verification failed"), "{message}");
+    assert!(message.contains("--ca-cert"), "{message}");
+
+    let tmp = tempdir().expect("tempdir");
+    let bundle = tmp.path().join("ca.pem");
+    std::fs::write(&bundle, TLS_CA).expect("write");
+    client.set_trust(&Trust::WithExtra(CaBundle {
+        path: bundle,
+        origin: "--ca-cert".to_owned(),
+    }));
+    let page = client.get(&url, None, None).expect("trusted CA");
+    assert_eq!(String::from_utf8_lossy(&page.body), TLS_INDEX_PAGE);
+}

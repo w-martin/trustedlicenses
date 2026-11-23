@@ -15,7 +15,7 @@ pub mod sdist;
 #[cfg(test)]
 mod tests;
 
-pub use http::HttpClient;
+pub use http::{CaBundle, HttpClient, Trust};
 pub use ranged::{open_wheel, ByteRange, RangeResponse, WheelSource};
 
 use crate::detection::{declared_keys, resolve_license_expression, Distribution};
@@ -97,6 +97,9 @@ pub trait Client: Sync {
 
     /// Describe where credentials for `url` come from, for the report.
     fn credentials_for(&self, url: &str) -> String;
+
+    /// Which certificate authorities HTTPS may chain to. Only a real network layer has any.
+    fn set_trust(&mut self, _trust: &Trust) {}
 
     /// What this client has fetched so far, when it keeps count.
     fn traffic(&self) -> Option<Traffic> {

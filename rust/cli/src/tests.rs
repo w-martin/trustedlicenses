@@ -1380,3 +1380,177 @@ fn prefer_installed_ignores_a_legacy_egg_info_copy() {
         r.out
     );
 }
+
+#[test]
+fn the_ca_cert_flag_beats_the_environment_and_system_certs_ignores_both() {
+    let parse = |args: &[&str]| {
+        Cli::try_parse_from(std::iter::once("trustedlicenses").chain(args.iter().copied()))
+    };
+    let env = HashMap::from([("SSL_CERT_FILE".to_owned(), "/env.pem".to_owned())]);
+    let extra = |path: &str, origin: &str| {
+        Trust::WithExtra(CaBundle {
+            path: PathBuf::from(path),
+            origin: origin.to_owned(),
+        })
+    };
+
+    let cli = parse(&[]).expect("parse");
+    assert_eq!(trust(&cli, &env), extra("/env.pem", "SSL_CERT_FILE"));
+    assert_eq!(trust(&cli, &HashMap::new()), Trust::Bundled);
+    let cli = parse(&["--ca-cert", "/flag.pem"]).expect("parse");
+    assert_eq!(trust(&cli, &env), extra("/flag.pem", "--ca-cert"));
+    let cli = parse(&["--system-certs"]).expect("parse");
+    assert_eq!(trust(&cli, &env), Trust::System);
+    assert!(parse(&["--system-certs", "--ca-cert", "/flag.pem"]).is_err());
+}
+
+const PERMISSIVE_POLICY: &str =
+    "[project]\nname = 'x'\n\n[tool.trustedlicenses]\nallowed-categories = [\"Permissive\"]\n";
+
+#[test]
+fn pin_dry_run_lists_the_licenses_and_writes_nothing() {
+    let h = Harness::new();
+    let pyproject = h.pyproject(PERMISSIVE_POLICY);
+    let venv = h.venv(&[("a", Some("MIT"), None), ("b", Some("MPL-2.0"), None)]);
+    let r = h.run(&[
+        "--pyproject",
+        &s(&pyproject),
+        "--venv",
+        &s(&venv),
+        "pin",
+        "--dry-run",
+    ]);
+    assert_eq!(r.code, 0, "{}{}", r.out, r.err);
+    assert!(r
+        .out
+        .contains("allowed-categories (Permissive) becomes allowed-licenses with 1 license(s):"));
+    assert!(r.out.contains("  MIT\n"), "{}", r.out);
+    assert!(!r.out.contains("MPL-2.0"), "{}", r.out);
+    assert!(r.out.contains("Dry run -- nothing written."));
+    assert_eq!(
+        fs::read_to_string(&pyproject).expect("read"),
+        PERMISSIVE_POLICY
+    );
+}
+
+#[test]
+fn pin_replaces_the_categories_and_a_second_run_says_so() {
+    let h = Harness::new();
+    let pyproject = h.pyproject(PERMISSIVE_POLICY);
+    let venv = h.venv(&[("a", Some("MIT"), None)]);
+    let r = h.run(&["--pyproject", &s(&pyproject), "--venv", &s(&venv), "pin"]);
+    assert_eq!(r.code, 0, "{}{}", r.out, r.err);
+    assert!(r
+        .out
+        .contains("A license new to the project now fails until you accept it."));
+    let written = fs::read_to_string(&pyproject).expect("read");
+    assert!(
+        written.contains("allowed-licenses = [\n    \"MIT\",\n]"),
+        "{written}"
+    );
+    assert!(!written.contains("allowed-categories"), "{written}");
+
+    let again = Harness::new();
+    let pyproject = again.pyproject(&written);
+    let r = again.run(&["--pyproject", &s(&pyproject), "pin"]);
+    assert_eq!(r.code, 0, "{}{}", r.out, r.err);
+    assert!(r.out.contains("is already pinned"), "{}", r.out);
+}
+
+#[test]
+fn pin_without_a_policy_says_how_to_make_one() {
+    let h = Harness::new();
+    let pyproject = h.pyproject("[project]\nname = 'x'\n");
+    let r = h.run(&["--pyproject", &s(&pyproject), "pin"]);
+    assert_eq!(r.code, 1);
+    assert!(
+        format!("{}{}", r.out, r.err).contains("there's no policy to pin yet"),
+        "{}{}",
+        r.out,
+        r.err
+    );
+}
+
+#[test]
+fn report_is_markdown_on_stdout_and_exits_zero_even_with_failures() {
+    let h = Harness::new();
+    let pyproject = h.pyproject(PERMISSIVE_POLICY);
+    let venv = h.venv(&[("a", Some("MIT"), None), ("b", Some("GPL-3.0-only"), None)]);
+    let r = h.run(&["--pyproject", &s(&pyproject), "--venv", &s(&venv), "report"]);
+    assert_eq!(r.code, 0, "{}{}", r.out, r.err);
+    assert!(
+        r.out.starts_with("# License policy report: x\n"),
+        "{}",
+        r.out
+    );
+    assert!(
+        r.out
+            .contains("- **Result:** 1 of 2 checked packages pass; 1 doesn't"),
+        "{}",
+        r.out
+    );
+    assert!(r.out.contains("| MIT | Permissive | 1: a |"), "{}", r.out);
+    assert!(r
+        .out
+        .contains("| b | GPL-3.0-only | Copyleft | license not allowed by the policy |"));
+    assert!(!r.out.contains("Checking dependency licenses"), "{}", r.out);
+}
+
+#[test]
+fn report_writes_to_a_file_with_output() {
+    let h = Harness::new();
+    let pyproject = h.pyproject(PERMISSIVE_POLICY);
+    let venv = h.venv(&[("a", Some("MIT"), None)]);
+    let target = pyproject.with_file_name("licenses.md");
+    let r = h.run(&[
+        "--pyproject",
+        &s(&pyproject),
+        "--venv",
+        &s(&venv),
+        "report",
+        "--output",
+        &s(&target),
+    ]);
+    assert_eq!(r.code, 0, "{}{}", r.out, r.err);
+    assert!(r.err.contains("Wrote the report to"), "{}", r.err);
+    assert!(r.out.is_empty(), "{}", r.out);
+    let written = fs::read_to_string(&target).expect("read");
+    assert!(written.contains("## What we accept"), "{written}");
+}
+
+#[test]
+fn report_errors_go_to_stderr_not_into_the_report() {
+    let h = Harness::new();
+    let pyproject = h.pyproject("[tool.trustedlicenses]\nallowed-categories = \"Permissive\"\n");
+    let r = h.run(&["--pyproject", &s(&pyproject), "report"]);
+    assert_eq!(r.code, 1);
+    assert!(r.out.is_empty(), "{}", r.out);
+    assert!(
+        r.err.contains("allowed-categories must be a list"),
+        "{}",
+        r.err
+    );
+}
+
+#[test]
+fn pin_marks_licenses_that_need_a_closer_look() {
+    let h = Harness::new();
+    let pyproject = h.pyproject(
+        "[project]\nname = 'x'\n\n[tool.trustedlicenses]\nallowed-categories = [\"Copyleft Limited\"]\n",
+    );
+    let venv = h.venv(&[("eupkg", Some("EUPL-1.2"), None)]);
+    let r = h.run(&[
+        "--pyproject",
+        &s(&pyproject),
+        "--venv",
+        &s(&venv),
+        "pin",
+        "--dry-run",
+    ]);
+    assert_eq!(r.code, 0, "{}{}", r.out, r.err);
+    assert!(
+        r.out.contains("  EUPL-1.2 (check individually: covers"),
+        "{}",
+        r.out
+    );
+}

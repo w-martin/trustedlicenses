@@ -31,12 +31,16 @@ const GPL3_FAMILY_IDS: [&str; 4] = [
 ];
 const GPL2_ONLY_ID: &str = "GPL-2.0-only";
 const GPL_FAQ_URL: &str = "https://www.gnu.org/licenses/gpl-faq.html#AllCompatibility";
+/// Where the FSF says, in these words, that GPLv2 is not by itself compatible with GPLv3.
+const GPLV2_ENTRY_URL: &str = "https://www.gnu.org/licenses/license-list.html#GPLv2";
 
 /// A project's license policy.
 #[derive(Clone, Debug, Default)]
 pub struct Policy {
     /// A distribution passes when at least one detected license is in one of these.
     pub allowed_categories: BTreeSet<String>,
+    /// SPDX ids allowed for every package, whatever their category.
+    pub allowed_licenses: BTreeSet<String>,
     /// Canonical names exempted from the check entirely. Trusts the package, whatever its license;
     /// prefer `accepted_licenses`.
     pub ignored_packages: BTreeSet<String>,
@@ -56,6 +60,8 @@ pub struct Policy {
     pub verified_packages: HashMap<String, (String, String)>,
     /// Declared statement -> the id a human verified it corrects to, for any package.
     pub verified_statements: HashMap<String, String>,
+    /// What the project is for; informational only.
+    pub use_case: Option<crate::config::UseCase>,
 }
 
 /// The outcome of evaluating a [`Policy`].
@@ -69,6 +75,9 @@ pub struct PolicyResult {
     /// Packages that pass only because the policy makes an exception for them, so a reviewer can
     /// see what is being relied on.
     pub exceptions: Vec<PolicyException>,
+    /// The policy names licenses, not categories, so a fix should too: suggesting a category
+    /// would undo the pin.
+    pub pinned: bool,
 }
 
 /// Why a package that fails the categories passes anyway.
@@ -109,12 +118,47 @@ impl PolicyResult {
     }
 }
 
-fn is_allowed(detected: &DistributionLicence, policy: &Policy) -> bool {
+pub(crate) fn is_allowed(detected: &DistributionLicence, policy: &Policy) -> bool {
     detected
         .categories
         .intersection(&policy.allowed_categories)
         .next()
         .is_some()
+        || detected
+            .keys
+            .intersection(&policy.allowed_licenses)
+            .next()
+            .is_some()
+}
+
+/// The licenses that let packages pass through `allowed-categories` today, plus any
+/// `allowed-licenses` already listed: allowing exactly these instead of the categories keeps
+/// every current result while failing any license that is new to the project.
+///
+/// Only a passing package's licenses that are themselves in an allowed category count: scipy
+/// passing on BSD-3-Clause doesn't pin the GPL text it also bundles.
+#[must_use]
+pub fn pin_licenses(detected: &[DistributionLicence], policy: &Policy) -> BTreeSet<String> {
+    let mut pinned = policy.allowed_licenses.clone();
+    for result in detected
+        .iter()
+        .filter(|result| !policy.ignored_packages.contains(&result.name))
+        .map(|result| effective_result(result, policy))
+    {
+        pinned.extend(
+            result
+                .keys
+                .iter()
+                .filter(|key| {
+                    categories_for([key.as_str()])
+                        .intersection(&policy.allowed_categories)
+                        .next()
+                        .is_some()
+                })
+                .cloned(),
+        );
+    }
+    pinned
 }
 
 enum Verdict {
@@ -173,7 +217,10 @@ fn trusted_suggestion_ids(detected: &DistributionLicence, policy: &Policy) -> BT
 
 /// Fold a trusted correction into a detection that otherwise resolved to nothing. It never
 /// overrides an existing declared-metadata or license-file match.
-fn effective_result(detected: &DistributionLicence, policy: &Policy) -> DistributionLicence {
+pub(crate) fn effective_result(
+    detected: &DistributionLicence,
+    policy: &Policy,
+) -> DistributionLicence {
     if !detected.keys.is_empty() || detected.suggested.is_empty() {
         return detected.clone();
     }
@@ -214,7 +261,7 @@ fn compatibility_note(detected: &DistributionLicence, policy: &Policy) -> Option
         if let Some(other) = joined_intersection(&detected.keys, &GPL3_FAMILY_IDS) {
             return Some(format!(
                 "  {name}: your project is GPL-2.0-only; {name} is {other} -- the FSF states GPLv2 is \
-                 not, by itself, compatible with GPLv3 ({GPL_FAQ_URL})"
+                 not, by itself, compatible with GPLv3 ({GPLV2_ENTRY_URL})"
             ));
         }
     }
@@ -222,7 +269,7 @@ fn compatibility_note(detected: &DistributionLicence, policy: &Policy) -> Option
         if let Some(mine) = joined_intersection(project, &GPL3_FAMILY_IDS) {
             return Some(format!(
                 "  {name}: your project is {mine}; {name} is GPL-2.0-only -- the FSF states GPLv2 is \
-                 not, by itself, compatible with GPLv3 ({GPL_FAQ_URL})"
+                 not, by itself, compatible with GPLv3 ({GPLV2_ENTRY_URL})"
             ));
         }
     }
@@ -324,6 +371,7 @@ pub fn reevaluate(detected: &[DistributionLicence], policy: &Policy) -> PolicyRe
         checked: results.len(),
         compatibility_notes,
         exceptions,
+        pinned: policy.allowed_categories.is_empty(),
     }
 }
 
@@ -362,7 +410,7 @@ pub fn format_failure(failure: &DistributionLicence) -> String {
 /// For a detected license the narrowest option comes first: the exact `accepted-licenses` line for
 /// this package, then the whole category.
 #[must_use]
-pub fn format_remediation(failure: &DistributionLicence) -> String {
+pub fn format_remediation(failure: &DistributionLicence, pinned: bool) -> String {
     if failure.unreadable {
         return "    -> its license could not be read, so this is not an unlicensed package and \
                 allow-unlicensed doesn't apply; fix the problem above, or trust the package outright \
@@ -406,6 +454,11 @@ pub fn format_remediation(failure: &DistributionLicence) -> String {
          [tool.trustedlicenses.accepted-licenses]",
         toml_key(&failure.name)
     );
+    if pinned {
+        return format!(
+            "    -> {accept}; or add {licenses} to allowed-licenses to allow it for every package"
+        );
+    }
     if failure.categories.is_empty() {
         return format!("    -> {accept}");
     }
@@ -604,7 +657,7 @@ mod tests {
 
     #[test]
     fn remediation_with_no_license_suggests_manual_verification() {
-        let line = format_remediation(&licence("bare", &[], &[], "no source"));
+        let line = format_remediation(&licence("bare", &[], &[], "no source"), false);
         assert!(line.contains("\"bare\""));
         assert!(line.contains("allow-unlicensed"));
         assert!(!line.contains("ignored-packages"));
@@ -621,7 +674,7 @@ mod tests {
             "license files: LICENSE",
         );
         assert_eq!(
-            format_remediation(&failure),
+            format_remediation(&failure, false),
             "    -> to accept only this license for this package, add `gplpkg = [\"GPL-2.0-only\"]` under \
              [tool.trustedlicenses.accepted-licenses]; or add \"Copyleft\" to allowed-categories to \
              allow every package in it"
@@ -636,7 +689,7 @@ mod tests {
             &["Copyleft"],
             "src",
         );
-        assert!(format_remediation(&failure)
+        assert!(format_remediation(&failure, false)
             .contains("`\"odd.name\" = [\"GPL-2.0-only\", \"MPL-2.0\"]`"));
     }
 
@@ -724,7 +777,7 @@ mod tests {
         unread.unreadable = true;
         let result = evaluated(&policy, &[unread.clone()]);
         assert!(!result.passed() && result.exceptions.is_empty());
-        let line = format_remediation(&unread);
+        let line = format_remediation(&unread, false);
         assert!(
             line.contains("could not be read") && !line.contains("set allow-unlicensed"),
             "{line}"
@@ -742,7 +795,10 @@ mod tests {
 
     #[test]
     fn remediation_with_a_suggestion_points_at_trusting_it() {
-        let line = format_remediation(&suggested_only("catboost", APACHE_TEXT, "Apache-2.0"));
+        let line = format_remediation(
+            &suggested_only("catboost", APACHE_TEXT, "Apache-2.0"),
+            false,
+        );
         for needle in [
             "Apache-2.0",
             APACHE_TEXT,
@@ -1048,5 +1104,132 @@ mod tests {
         let result = reevaluate(&detected, &policy);
         assert!(result.passed());
         assert_eq!(result.checked, 0);
+    }
+
+    #[test]
+    fn allowed_licenses_pass_a_package_whatever_its_category() {
+        let policy = Policy {
+            allowed_licenses: set(&["MPL-2.0"]),
+            ..Policy::default()
+        };
+        let found = [
+            licence("certifi", &["MPL-2.0"], &["Copyleft Limited"], "metadata"),
+            licence(
+                "other",
+                &["LGPL-3.0-only"],
+                &["Copyleft Limited"],
+                "metadata",
+            ),
+        ];
+        let result = evaluated(&policy, &found);
+        assert_eq!(result.failures.len(), 1);
+        assert_eq!(result.failures[0].name, "other");
+        assert!(result.pinned);
+    }
+
+    #[test]
+    fn pinning_keeps_only_the_licenses_that_pass_through_a_category() {
+        let policy = Policy {
+            allowed_licenses: set(&["MPL-2.0"]),
+            ignored_packages: set(&["skipped"]),
+            ..allowing(&["Permissive"])
+        };
+        let found = [
+            licence(
+                "scipy",
+                &["BSD-3-Clause", "GPL-3.0-or-later"],
+                &["Permissive", "Copyleft"],
+                "files",
+            ),
+            licence("gplpkg", &["GPL-2.0-only"], &["Copyleft"], "metadata"),
+            licence("skipped", &["ISC"], &["Permissive"], "metadata"),
+            licence("mit", &["MIT"], &["Permissive"], "metadata"),
+        ];
+        assert_eq!(
+            pin_licenses(&found, &policy),
+            set(&["BSD-3-Clause", "MIT", "MPL-2.0"])
+        );
+    }
+
+    #[test]
+    fn a_pinned_policy_judges_todays_packages_exactly_as_the_categories_did() {
+        let policy = allowing(&["Permissive", "Copyleft Limited"]);
+        let found = [
+            licence(
+                "scipy",
+                &["BSD-3-Clause", "GPL-3.0-or-later"],
+                &["Permissive", "Copyleft"],
+                "files",
+            ),
+            licence("certifi", &["MPL-2.0"], &["Copyleft Limited"], "metadata"),
+            licence("gplpkg", &["GPL-2.0-only"], &["Copyleft"], "metadata"),
+            licence("bare", &[], &[], "no source"),
+        ];
+        let pinned = Policy {
+            allowed_categories: BTreeSet::new(),
+            allowed_licenses: pin_licenses(&found, &policy),
+            ..policy.clone()
+        };
+        let names = |result: &PolicyResult| {
+            result
+                .failures
+                .iter()
+                .map(|f| f.name.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            names(&evaluated(&pinned, &found)),
+            names(&evaluated(&policy, &found))
+        );
+        // A license new to the project now fails, though its category is still "allowed".
+        let newcomer = [licence(
+            "newpkg",
+            &["EPL-2.0"],
+            &["Copyleft Limited"],
+            "metadata",
+        )];
+        assert!(evaluated(&policy, &newcomer).passed());
+        assert!(!evaluated(&pinned, &newcomer).passed());
+    }
+
+    #[test]
+    fn a_pinned_policy_suggests_a_license_not_a_category() {
+        let failure = licence("newpkg", &["EPL-2.0"], &["Copyleft Limited"], "metadata");
+        let pinned = format_remediation(&failure, true);
+        assert!(
+            pinned.contains("add \"EPL-2.0\" to allowed-licenses"),
+            "{pinned}"
+        );
+        assert!(!pinned.contains("allowed-categories"), "{pinned}");
+        assert!(format_remediation(&failure, false).contains("to allowed-categories"));
+    }
+
+    #[test]
+    fn a_with_license_passes_only_when_accepted_explicitly() {
+        use crate::detection::resolve_license_expression;
+        let keys = resolve_license_expression("GPL-3.0-only WITH LLVM-exception");
+        let found = [DistributionLicence {
+            name: "llvmpkg".to_owned(),
+            categories: categories_for(keys.iter().map(String::as_str)),
+            keys,
+            source: "metadata".to_owned(),
+            ..DistributionLicence::default()
+        }];
+        let base = allowing(&["Permissive", "Public Domain", "Copyleft Limited"]);
+        assert!(!evaluated(&base, &found).passed());
+        assert!(pin_licenses(&found, &base).is_empty());
+        let listed = Policy {
+            allowed_licenses: set(&["GPL-3.0-only WITH LLVM-exception"]),
+            ..base.clone()
+        };
+        assert!(evaluated(&listed, &found).passed());
+        let accepted = Policy {
+            accepted_licenses: BTreeMap::from([(
+                "llvmpkg".to_owned(),
+                set(&["GPL-3.0-only WITH LLVM-exception"]),
+            )]),
+            ..base
+        };
+        assert!(evaluated(&accepted, &found).passed());
     }
 }

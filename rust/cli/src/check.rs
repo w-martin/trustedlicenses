@@ -57,7 +57,7 @@ pub fn print_result(ctx: &mut Context, result: &PolicyResult) {
         );
         for failure in &result.failures {
             term.echo(&format_failure(failure));
-            term.echo(&format_remediation(failure));
+            term.echo(&format_remediation(failure, result.pinned));
         }
     }
 }
@@ -142,7 +142,7 @@ fn describe(detected: &DistributionLicence) -> String {
 }
 
 /// Apply command-line switches over the policy read from the config.
-fn with_overrides(mut policy: Policy, cli: &Cli) -> Policy {
+pub(crate) fn with_overrides(mut policy: Policy, cli: &Cli) -> Policy {
     policy.allow_unlicensed |= cli.allow_unlicensed;
     policy
 }

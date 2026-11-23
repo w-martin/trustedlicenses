@@ -134,6 +134,14 @@ fn category_table_ci() -> &'static HashMap<String, String> {
     })
 }
 
+/// The canonical spelling of a known license id, matched without regard to case.
+#[must_use]
+pub fn known_license_id(id: &str) -> Option<&'static str> {
+    category_table_ci()
+        .get(&id.to_lowercase())
+        .map(String::as_str)
+}
+
 /// Normalise a distribution name per PEP 503.
 #[must_use]
 pub fn canonical_name(raw: &str) -> String {
@@ -192,15 +200,6 @@ fn licence_files(dist_info: Option<&Path>) -> Vec<PathBuf> {
 }
 
 /// Split an expression or trove classifier into candidate identifier tokens.
-fn expression_tokens(expression: &str) -> BTreeSet<&str> {
-    expression
-        .split(|c: char| c.is_whitespace() || c == '(' || c == ')')
-        .filter(|token| {
-            !token.is_empty() && !SPDX_OPERATORS.contains(&token.to_lowercase().as_str())
-        })
-        .collect()
-}
-
 fn read_text(path: &Path) -> String {
     let bytes = fs::read(path).unwrap_or_default();
     // Python's `read_text` applies universal newlines; matching must see the same text.
@@ -214,6 +213,9 @@ fn keys_from_licence_files(files: &[PathBuf]) -> BTreeSet<String> {
         .iter()
         .flat_map(|path| scan_license_text(&read_text(path), DEFAULT_CONFIDENCE_THRESHOLD))
         .map(|(spdx_id, _score)| spdx_id)
+        // Exception text beside a license can't say which license it modifies here, so the
+        // license is judged on its own, which fails closed.
+        .filter(|spdx_id| !is_exception(spdx_id))
         .collect()
 }
 
@@ -238,10 +240,45 @@ fn declared_statements(metadata: &Metadata) -> Vec<String> {
 #[must_use]
 pub fn resolve_license_expression(expression: &str) -> BTreeSet<String> {
     let index = category_table_ci();
-    expression_tokens(expression)
-        .into_iter()
-        .filter_map(|token| index.get(&token.to_lowercase()).cloned())
-        .collect()
+    let canonical = |token: &str| index.get(&token.to_lowercase()).cloned();
+    let tokens: Vec<&str> = expression
+        .split(|c: char| c.is_whitespace() || c == '(' || c == ')')
+        .filter(|token| !token.is_empty())
+        .collect();
+    let mut keys = BTreeSet::new();
+    let mut index_of = 0;
+    while index_of < tokens.len() {
+        let token = tokens[index_of];
+        let with = tokens
+            .get(index_of + 1)
+            .is_some_and(|next| next.eq_ignore_ascii_case("with"));
+        if with {
+            // `X WITH Y` is its own license: the exception changes what X asks, so neither
+            // X's category nor the exception's stands in for it.
+            // An unrecognised qualifier keeps its own text: it could restrict X (Commons
+            // Clause does), so X alone mustn't pass for it.
+            if let (Some(base), Some(qualifier)) = (canonical(token), tokens.get(index_of + 2)) {
+                let qualifier = canonical(qualifier).unwrap_or_else(|| (*qualifier).to_owned());
+                keys.insert(format!("{base} WITH {qualifier}"));
+            }
+            index_of += 3;
+            continue;
+        }
+        if !SPDX_OPERATORS.contains(&token.to_lowercase().as_str()) {
+            if let Some(key) = canonical(token).filter(|key| !is_exception(key)) {
+                keys.insert(key);
+            }
+        }
+        index_of += 1;
+    }
+    keys
+}
+
+/// An SPDX license exception (`LLVM-exception`, `Classpath-exception-2.0`, ...): it only
+/// ever modifies a license, so it is never a license by itself.
+#[must_use]
+pub fn is_exception(id: &str) -> bool {
+    spdx::exception_id(id).is_some()
 }
 
 fn keys_from_declared(statements: &[String]) -> BTreeSet<String> {
@@ -314,7 +351,9 @@ fn correct_license_statement(statement: &str) -> Option<String> {
         let corrected = corrected.trim();
         if corrected != candidate {
             if let Some(canonical) = index.get(&corrected.to_lowercase()) {
-                return Some(canonical.clone());
+                if !is_exception(canonical) {
+                    return Some(canonical.clone());
+                }
             }
         }
     }
@@ -324,14 +363,20 @@ fn correct_license_statement(statement: &str) -> Option<String> {
             continue;
         }
         let transposed = candidate.replace(pattern, replacement);
-        if let Some(canonical) = index.get(&transposed.to_lowercase()) {
+        if let Some(canonical) = index
+            .get(&transposed.to_lowercase())
+            .filter(|id| !is_exception(id))
+        {
             return Some(canonical.clone());
         }
         for transform in &transforms {
             let corrected = transform(&transposed);
             let corrected = corrected.trim();
             if corrected != transposed {
-                if let Some(canonical) = index.get(&corrected.to_lowercase()) {
+                if let Some(canonical) = index
+                    .get(&corrected.to_lowercase())
+                    .filter(|id| !is_exception(id))
+                {
                     return Some(canonical.clone());
                 }
             }
@@ -781,7 +826,8 @@ mod tests {
             ("Public Domain", None, &[]),
             ("MIT OR Apache-2.0", None, &["Apache-2.0", "MIT"]),
             ("(MIT AND BSD-2-Clause)", None, &["BSD-2-Clause", "MIT"]),
-            ("MIT with exception", None, &["MIT"]),
+            // A WITH qualifier is part of the license, so plain MIT mustn't stand in for it.
+            ("MIT with exception", None, &["MIT WITH exception"]),
             ("License :: OSI Approved :: MIT License", None, &["MIT"]),
             ("ß License 2.0", None, &[]),
             ("Apache\t2.0", Some("Apache-2.0"), &[]),
@@ -811,5 +857,44 @@ mod tests {
         assert_eq!(canonical_name("A.B_c--d"), "a-b-c-d");
         assert_eq!(canonical_name("  Foo_-.Bar "), "foo-bar");
         assert_eq!(canonical_name("plain"), "plain");
+    }
+
+    #[test]
+    fn a_with_expression_is_one_license_with_no_category() {
+        for (expression, key) in [
+            (
+                "GPL-3.0-only WITH LLVM-exception",
+                "GPL-3.0-only WITH LLVM-exception",
+            ),
+            (
+                "(GPL-2.0-only WITH Classpath-exception-2.0)",
+                "GPL-2.0-only WITH Classpath-exception-2.0",
+            ),
+            (
+                "apache-2.0 with llvm-exception",
+                "Apache-2.0 WITH LLVM-exception",
+            ),
+        ] {
+            let keys = resolve_license_expression(expression);
+            assert_eq!(keys, BTreeSet::from([key.to_owned()]), "{expression}");
+            assert!(
+                categories_for(keys.iter().map(String::as_str)).is_empty(),
+                "{expression}"
+            );
+        }
+        assert_eq!(
+            resolve_license_expression("MIT OR GPL-2.0-only WITH Classpath-exception-2.0"),
+            BTreeSet::from([
+                "GPL-2.0-only WITH Classpath-exception-2.0".to_owned(),
+                "MIT".to_owned()
+            ])
+        );
+    }
+
+    #[test]
+    fn a_bare_exception_is_never_a_license() {
+        assert!(resolve_license_expression("LLVM-exception").is_empty());
+        assert!(is_exception("Classpath-exception-2.0"));
+        assert!(!is_exception("MIT"));
     }
 }

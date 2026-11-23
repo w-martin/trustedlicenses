@@ -26,7 +26,9 @@ mod args;
 mod check;
 mod context;
 mod gather;
+mod pin;
 mod prompt;
+mod report;
 mod resolve;
 mod wizard;
 
@@ -40,8 +42,11 @@ pub use wizard::{InteractiveWizard, NoWizard, Services, Wizard};
 
 use args::{Cli, Command};
 use clap::Parser;
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io::Write;
+use trustedlicenses_core::index::{CaBundle, Trust};
+use trustedlicenses_core::index_discovery::{discover_ca_bundle, DiscoveryContext};
 
 /// Run the CLI with `args` (including the program name) and return the exit code.
 pub fn run(args: &[OsString], ctx: &mut Context) -> i32 {
@@ -66,11 +71,29 @@ pub fn run(args: &[OsString], ctx: &mut Context) -> i32 {
             .filter(|_| !cli.no_cache)
             .map(|dir| dir.join("matches")),
     );
+    let trust = trust(&cli, &ctx.env);
+    ctx.client.set_trust(&trust);
     match &cli.command {
         None => check::check_environment(ctx, &cli),
         Some(Command::Check { packages }) => check::check_new_packages(ctx, &cli, packages),
         Some(Command::IndexCheck { package }) => check::index_check(ctx, &cli, package),
+        Some(Command::Pin { dry_run }) => pin::pin(ctx, &cli, *dry_run),
+        Some(Command::Report { output }) => report::report(ctx, &cli, output.as_deref()),
     }
+}
+
+fn trust(cli: &Cli, env: &HashMap<String, String>) -> Trust {
+    if cli.system_certs {
+        return Trust::System;
+    }
+    if let Some(path) = &cli.ca_cert {
+        return Trust::WithExtra(CaBundle {
+            path: path.clone(),
+            origin: "--ca-cert".to_owned(),
+        });
+    }
+    discover_ca_bundle(&DiscoveryContext::from_env(env.clone()))
+        .map_or(Trust::Bundled, Trust::WithExtra)
 }
 
 /// Run the command line against the real process: its terminal, environment and network.

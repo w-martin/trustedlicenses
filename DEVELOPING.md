@@ -78,9 +78,9 @@ Two things to know when changing the build:
   strip symbols or only debug info. `inv check-wheel` exists to catch this class of
   failure: it *loads* the extension, not just checks that it is present.
 
-`TRUSTEDLICENSES_TRACE=1` prints every package-index request's time, size and URL to
-standard error, which is how the lock-file audit was tuned (see
-[Performance](docs/performance.md#auditing-a-lock-file)).
+`TRUSTEDLICENSES_TRACE=1` prints every package-index request's time, size and URL, and each
+scanned file's time and size, to standard error. That's how the lock-file audit was tuned
+([Design notes](#lock-file-audit-traffic)).
 
 Allocators: jemalloc on Linux (including the static musl executables), mimalloc on
 Windows, the platform's on macOS. Build with `--features system-allocator` to compare.
@@ -96,9 +96,9 @@ allowed-categories = ["Permissive", "Public Domain", "Copyleft Limited"]
 ignored-packages = ["mypy-extensions"]
 ```
 
-`allowed-categories` is required -- there is no default, so a project states its
-policy explicitly rather than inheriting an assumption about what it's willing to
-accept. See `rust/core/src/config.rs` for the full format.
+`allowed-categories` (or, for a pinned policy, `allowed-licenses`) is required -- there is
+no default, so a project states its policy explicitly rather than inheriting an assumption
+about what it's willing to accept. See `rust/core/src/config.rs` for the full format.
 
 Run the check with:
 
@@ -123,3 +123,73 @@ Docs source lives in `docs/`; `mkdocs.yml` controls navigation.
 This project bundles data derived from the SPDX License List and ScanCode Toolkit's
 license database, and depends on the Apache-2.0-licensed `spdx` Rust crate. See
 `NOTICE` for the required attribution.
+
+## Design notes
+
+Measurements below were taken on the [Performance](docs/performance.md) benchmark environment
+when it had 436 packages (18 cores); the current figures are on that page.
+
+### Lock-file audit traffic
+
+Reading the simple-API listing for every package, and whole wheels for license files, took
+4.2s cold and moved 288 MB to learn about 6 MB of license data:
+
+| | Listings and whole wheels | Current |
+|---|---|---|
+| Project listings (`/simple/<name>/`) | 436 requests, 195 MB | skipped on pypi.org |
+| Whole wheels, to read a license file | about 100 downloads | ranged reads |
+| Bytes fetched | 288 MB | **26 MB** |
+| Requests | 968 | 976 |
+| Cold run, 8 lookups at a time | 4.2s | 3.2s |
+| Cold run, 16 lookups at a time | – | 2.4s |
+
+A listing names every file of every release (`pydantic-core`'s alone is 9.8 MB), so for the
+default index the single-release document pypi.org serves (`/pypi/<name>/<version>/json`) is
+used instead; any other index, and any failure there, uses the standard simple API. A wheel
+is a zip with its index at the end, so when declared metadata names no license the wheel is
+opened with HTTP `Range` requests: the index first, then only `METADATA` and the license
+files, typically one request of up to 128 KB. A server that ignores `Range` gets a whole-file
+download, capped at 25 MB. With the traffic cut, what's left is per-request latency across a
+chain of dependent requests per package, which is why lookups run concurrently (`--jobs`).
+
+### Why the fallback scans run concurrently
+
+Each package's detection is independent, so the native build spreads them over a
+work-stealing thread pool (`rayon`, in
+[`detect_all`](https://github.com/w-martin/trustedlicenses/blob/main/rust/core/src/policy.rs))
+with no interpreter lock to serialize on. The pure-Python 0.3.4 got the same effect with a
+`ThreadPoolExecutor` and a native matcher that released the GIL during each scan.
+
+The bundled license files of the 91 packages that need the fallback come to 80 distinct
+texts, which take 5.2s combined run one at a time. Some take well over half a second:
+`docutils`'s `COPYING.rst`, a short but structurally complex document mixing a public-domain
+dedication with several third-party license exceptions, takes 794ms; `numba`'s and
+`paramiko`'s take 732ms and 678ms.
+
+### Text matching costs and design choices
+
+A file is scanned as a series of windows of lines, each scored against the whole SPDX corpus.
+Single-threaded, a plain 11 KB Apache-2.0 text takes about 0.17s. Each file is scanned
+sequentially, so on 18 cores the run (about 1.0s) is close to the slowest file, which sets
+the floor however many cores are free.
+
+Identical texts are scanned once, before detection fans out over packages, with identical
+results. 16 of the 96 files scanned were byte-identical repeats, 26% of the scan time (the
+Apache-2.0 text alone appears 9 times). Repeats are found by comparing the text itself, not a
+hash, so a crafted license file can't borrow another's result. On 18 cores that shortens a
+run by only 5-8%; limited to what a CI runner has (`RAYON_NUM_THREADS`), the run took 84% of
+its previous time on 2 threads and 70% on 4.
+
+Each text's matches are cached on disk beside the other caches, keyed by a SHA-256 of the
+full text, the matching threshold and the license-data version, and give the same output as
+a fresh scan. A truncated or corrupt entry is a miss, never an answer.
+
+Two speedups were left out. Scoring a file's windows in parallel reproduced the decisions
+exactly on all 463 license files in this environment and was 3.6x faster on that set, but on
+a normal run it used 1.5-2x the CPU, because the extra threads spin and over-compute, and it
+meant keeping a copy of the library's algorithm. A shortcut for an unmodified single license
+(score the whole text against its best match, and skip the window search when that match
+covers all but a few words) disagreed with the full search on 10 of 998 inputs: it found a
+license in roughly 1 KB MIT and BSD texts that the window search doesn't, and left `Pixar`
+out of an Apache text with a few extra words. Either difference changes a verdict, and the
+result cache already removes the cost after the first run, so the search stays exact.

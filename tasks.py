@@ -1,5 +1,6 @@
 """Invoke tasks for trustedlicenses development."""
 
+import sys
 from pathlib import Path
 from shutil import rmtree
 from sysconfig import get_config_var, get_path
@@ -15,6 +16,10 @@ EXTENSION_SUFFIXES = {".so", ".pyd"}
 PYTHON_FLOOR = "3.11"
 # (crate directory, extension module name): the extension modules staged into the package.
 EXTENSIONS = ((RUST_DIR / "python", "_rust"),)
+# The maturin arguments of each stable-ABI build staged side by side: abi3 for GIL interpreters, and abi3t
+# (PEP 803) for free-threaded 3.15+, which loads nothing else. maturin needs only the interpreter's name for
+# a stable-ABI build, not the interpreter. Windows names both `_rust.pyd`, so it gets abi3 alone.
+ABI_BUILDS = ("",) if sys.platform == "win32" else ("", "-i python3.15t --features pyo3/abi3t-py315")
 
 
 def _installed_binary() -> Path | None:
@@ -34,24 +39,25 @@ def _staged_extensions() -> list[Path]:
 
 
 def _stage_extensions(ctx: Context, *, release: bool) -> None:
-    """Build the extension module and copy it into the package directory, where the wheel picks it up.
+    """Build the extension module for each stable ABI and copy it into the package directory, for the wheel.
 
     maturin builds it, not cargo, so the cross-compiling toolchains and the macOS link flags are the ones
     the wheels use. The package's own wheel is built with `bindings = "bin"`, which cannot build it.
     """
     profile = "--release" if release else ""
     for crate, name in EXTENSIONS:
-        rmtree(EXTENSION_BUILD_DIR, ignore_errors=True)
-        # From the crate's own directory: maturin would otherwise apply the root pyproject's `bindings = "bin"`.
-        with ctx.cd(crate):
-            ctx.run(f'maturin build {profile} -o "{EXTENSION_BUILD_DIR.resolve()}"')
         for stale in PACKAGE_DIR.glob(f"{name}.*"):
             if stale.suffix in EXTENSION_SUFFIXES:
                 stale.unlink()
-        with ZipFile(next(EXTENSION_BUILD_DIR.glob("*.whl"))) as wheel:
-            for member in wheel.namelist():
-                if Path(member).name.startswith(f"{name}.") and Path(member).suffix in EXTENSION_SUFFIXES:
-                    (PACKAGE_DIR / Path(member).name).write_bytes(wheel.read(member))
+        for abi in ABI_BUILDS:
+            rmtree(EXTENSION_BUILD_DIR, ignore_errors=True)
+            # From the crate's own directory: maturin would otherwise apply the root pyproject's `bindings = "bin"`.
+            with ctx.cd(crate):
+                ctx.run(f'maturin build {profile} {abi} -o "{EXTENSION_BUILD_DIR.resolve()}"')
+            with ZipFile(next(EXTENSION_BUILD_DIR.glob("*.whl"))) as wheel:
+                for member in wheel.namelist():
+                    if Path(member).name.startswith(f"{name}.") and Path(member).suffix in EXTENSION_SUFFIXES:
+                        (PACKAGE_DIR / Path(member).name).write_bytes(wheel.read(member))
 
 
 def _needs_build() -> bool:
@@ -63,7 +69,7 @@ def _needs_build() -> bool:
     """
     binary = _installed_binary()
     extensions = _staged_extensions()
-    if binary is None or len(extensions) < len(EXTENSIONS):
+    if binary is None or len(extensions) < len(EXTENSIONS) * len(ABI_BUILDS):
         return True
 
     built = min(binary.stat().st_mtime, *(extension.stat().st_mtime for extension in extensions))
@@ -97,10 +103,14 @@ def wheel(ctx: Context) -> None:
     ctx.run("maturin build --profile cli -o dist")
 
 
-@task(name="check-wheel")
-def check_built_wheel(ctx: Context) -> None:
-    """Install the wheel in dist/ into a clean venv and run every way of starting the command line."""
-    ctx.run("python scripts/check_wheel.py dist")
+@task(name="check-wheel", iterable=["python"])
+def check_built_wheel(ctx: Context, python: list[str] | None = None) -> None:
+    """Install the wheel in dist/ into a clean venv and run every way of starting the command line.
+
+    Repeat `--python` to check it under each of those interpreters instead of this one.
+    """
+    interpreters = " ".join(f'"{interpreter}"' for interpreter in python or [])
+    ctx.run(f"python scripts/check_wheel.py dist {interpreters}")
 
 
 @task(name="format-check")

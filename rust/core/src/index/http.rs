@@ -16,6 +16,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
+use ureq::tls::{Certificate, PemItem, RootCerts, TlsConfig};
 use url::Url;
 
 const HTTP_UNAUTHORIZED: u16 = 401;
@@ -37,23 +38,148 @@ pub fn http_message(status: u16, url: &str) -> String {
     }
 }
 
+/// A PEM file of extra CA certificates to trust, and where its path came from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CaBundle {
+    pub path: PathBuf,
+    /// Shown in messages, e.g. `--ca-cert` or `SSL_CERT_FILE`.
+    pub origin: String,
+}
+
+/// Which certificate authorities an index's TLS certificate may chain to.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Trust {
+    /// Mozilla's roots, built into the binary.
+    #[default]
+    Bundled,
+    /// The bundled roots plus every certificate in a PEM file, e.g. a private CA.
+    WithExtra(CaBundle),
+    /// The operating system's certificate store.
+    System,
+}
+
+impl Trust {
+    fn describe(&self) -> String {
+        match self {
+            Self::Bundled => "the bundled Mozilla roots".to_owned(),
+            Self::WithExtra(bundle) => format!(
+                "the bundled Mozilla roots plus {} (from {})",
+                bundle.path.display(),
+                bundle.origin
+            ),
+            Self::System => "the operating system's certificate store (--system-certs)".to_owned(),
+        }
+    }
+}
+
+fn pem_certificates(bytes: &[u8]) -> Result<Vec<Certificate<'static>>, String> {
+    let mut certificates = Vec::new();
+    for item in ureq::tls::parse_pem(bytes) {
+        if let PemItem::Certificate(certificate) = item.map_err(|error| error.to_string())? {
+            certificates.push(certificate);
+        }
+    }
+    Ok(certificates)
+}
+
+fn load_ca_bundle(bundle: &CaBundle) -> Result<Vec<Certificate<'static>>, String> {
+    let shown = format!("{} (from {})", bundle.path.display(), bundle.origin);
+    let unreadable = |error: std::io::Error| format!("Cannot read CA bundle {shown}: {error}.");
+    let certificates = if bundle.path.is_dir() {
+        // A certificate directory, as OpenSSL and requests accept: every PEM file in it.
+        // Anything else there (an index, a README) is skipped rather than fatal.
+        let mut files: Vec<PathBuf> = fs::read_dir(&bundle.path)
+            .map_err(unreadable)?
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.is_file())
+            .collect();
+        files.sort();
+        files
+            .iter()
+            .filter_map(|path| fs::read(path).ok())
+            .filter_map(|bytes| pem_certificates(&bytes).ok())
+            .flatten()
+            .collect()
+    } else {
+        let bytes = fs::read(&bundle.path).map_err(unreadable)?;
+        pem_certificates(&bytes)
+            .map_err(|error| format!("CA bundle {shown} is not valid PEM: {error}."))?
+    };
+    if certificates.is_empty() {
+        return Err(format!(
+            "CA bundle {shown} holds no PEM certificates (-----BEGIN CERTIFICATE-----)."
+        ));
+    }
+    Ok(certificates)
+}
+
+fn root_certs(trust: &Trust) -> Result<RootCerts, String> {
+    Ok(match trust {
+        Trust::Bundled => RootCerts::WebPki,
+        Trust::System => RootCerts::PlatformVerifier,
+        Trust::WithExtra(bundle) => {
+            let extra = load_ca_bundle(bundle)?;
+            let mozilla = webpki_root_certs::TLS_SERVER_ROOT_CERTS
+                .iter()
+                .map(|der| Certificate::from_der(der.as_ref()));
+            RootCerts::from(mozilla.chain(extra))
+        }
+    })
+}
+
+fn build_agent(timeout: Duration, trust: &Trust) -> Result<ureq::Agent, String> {
+    let tls = TlsConfig::builder().root_certs(root_certs(trust)?).build();
+    Ok(ureq::Agent::config_builder()
+        .timeout_global(Some(timeout))
+        .user_agent("trustedlicenses")
+        .redirect_auth_headers(ureq::config::RedirectAuthHeaders::SameHost)
+        .tls_config(tls)
+        .build()
+        .into())
+}
+
+/// rustls reports a failed handshake as an I/O error, so look inside those too.
+fn is_tls_error(error: &ureq::Error) -> bool {
+    match error {
+        ureq::Error::Rustls(_) | ureq::Error::Pem(_) | ureq::Error::Tls(_) => true,
+        ureq::Error::Io(io) => io
+            .get_ref()
+            .is_some_and(|inner| inner.downcast_ref::<rustls::Error>().is_some()),
+        _ => false,
+    }
+}
+
 #[must_use]
-pub fn network_message(error: &ureq::Error, url: &str) -> String {
-    let is_tls = matches!(
-        error,
-        ureq::Error::Rustls(_) | ureq::Error::Pem(_) | ureq::Error::Tls(_)
-    );
-    if is_tls {
-        return tls_message(&error.to_string(), url);
+pub fn network_message(error: &ureq::Error, url: &str, trust: &Trust) -> String {
+    if is_tls_error(error) {
+        let reason = match error {
+            ureq::Error::Io(io) => io.to_string(),
+            other => other.to_string(),
+        };
+        return tls_message(&reason, url, trust);
     }
     format!("Could not reach {}: {error}.", redact_url(url))
 }
 
-fn tls_message(reason: &str, url: &str) -> String {
+fn tls_message(reason: &str, url: &str, trust: &Trust) -> String {
+    let advice = match trust {
+        Trust::Bundled => {
+            "If your index uses a private CA, pass its certificate with --ca-cert FILE (or set \
+             SSL_CERT_FILE), or use --system-certs to trust your operating system's store."
+        }
+        Trust::WithExtra(_) => {
+            "Check that the file holds the CA that issued this index's certificate, plus any \
+             intermediate certificate the server does not send."
+        }
+        Trust::System => {
+            "Check that your operating system trusts this index's CA, or pass it with --ca-cert \
+             FILE instead of --system-certs."
+        }
+    };
     format!(
-        "TLS verification failed for {}: {reason}. If your index uses a private CA, \
-         point SSL_CERT_FILE at its certificate bundle.",
-        redact_url(url)
+        "TLS verification failed for {}: {reason}. Trusting {}. {advice}",
+        redact_url(url),
+        trust.describe()
     )
 }
 
@@ -140,9 +266,12 @@ fn netloc(url: &Url) -> String {
     }
 }
 
-/// The real network layer, honouring proxy and CA settings from the environment.
+/// The real network layer, honouring proxy settings from the environment.
 pub struct HttpClient {
-    agent: ureq::Agent,
+    /// An unusable CA bundle is reported by the first request, so a run that never touches the
+    /// network is not failed by a stale `SSL_CERT_FILE`.
+    agent: Result<ureq::Agent, String>,
+    trust: Trust,
     timeout: Duration,
     netrc: Option<PathBuf>,
     url_credentials: Mutex<HashMap<String, (String, String)>>,
@@ -170,13 +299,10 @@ impl HttpClient {
     /// process environment.
     #[must_use]
     pub fn with_options(timeout: Duration, netrc: Option<PathBuf>) -> Self {
-        let config = ureq::Agent::config_builder()
-            .timeout_global(Some(timeout))
-            .user_agent("trustedlicenses")
-            .redirect_auth_headers(ureq::config::RedirectAuthHeaders::SameHost)
-            .build();
+        let trust = Trust::Bundled;
         Self {
-            agent: config.into(),
+            agent: build_agent(timeout, &trust),
+            trust,
             timeout,
             netrc,
             url_credentials: Mutex::new(HashMap::new()),
@@ -219,6 +345,11 @@ fn basic(user: &str, password: &str) -> String {
 }
 
 impl Client for HttpClient {
+    fn set_trust(&mut self, trust: &Trust) {
+        self.agent = build_agent(self.timeout, trust);
+        self.trust = trust.clone();
+    }
+
     fn traffic(&self) -> Option<Traffic> {
         Some(Traffic {
             requests: self.requests.load(Ordering::Relaxed),
@@ -324,6 +455,10 @@ impl HttpClient {
                 redact_url(url)
             )));
         }
+        let agent = self
+            .agent
+            .as_ref()
+            .map_err(|message| query(message.clone()))?;
         let credentials = self.credentials(&parsed);
         let mut clean = parsed.clone();
         let _ = clean.set_username("");
@@ -332,7 +467,7 @@ impl HttpClient {
 
         self.requests.fetch_add(1, Ordering::Relaxed);
         let started = std::time::Instant::now();
-        let mut request = self.agent.get(&clean);
+        let mut request = agent.get(&clean);
         if let Some(accept) = accept {
             request = request.header("Accept", accept);
         }
@@ -359,7 +494,7 @@ impl HttpClient {
                 self.timeout.as_secs_f64(),
                 redact_url(&clean)
             )),
-            other => query(network_message(&other, &clean)),
+            other => query(network_message(&other, &clean, &self.trust)),
         })?;
 
         let status = response.status().as_u16();
@@ -401,7 +536,7 @@ impl HttpClient {
                             self.timeout.as_secs_f64(),
                             redact_url(&clean)
                         )),
-                        other => query(network_message(&other, &clean)),
+                        other => query(network_message(&other, &clean, &self.trust)),
                     })?;
                 if body.len() > max {
                     return Err(too_large(max));
@@ -413,7 +548,7 @@ impl HttpClient {
                 .with_config()
                 .limit(u64::MAX)
                 .read_to_vec()
-                .map_err(|error| query(network_message(&error, &clean)))?,
+                .map_err(|error| query(network_message(&error, &clean, &self.trust)))?,
         };
         self.bytes.fetch_add(body.len() as u64, Ordering::Relaxed);
         if self.trace {
@@ -455,17 +590,108 @@ mod tests {
     }
 
     #[test]
-    fn a_tls_failure_names_ssl_cert_file() {
-        assert!(
-            tls_message("certificate verify failed", "https://idx/pkg/").contains("SSL_CERT_FILE")
-        );
+    fn a_tls_failure_with_bundled_roots_suggests_the_ca_options() {
+        let message = tls_message("UnknownIssuer", "https://idx/pkg/", &Trust::Bundled);
+        assert!(message.contains("--ca-cert"));
+        assert!(message.contains("SSL_CERT_FILE"));
+        assert!(message.contains("--system-certs"));
     }
 
     #[test]
-    fn a_plain_connection_failure_does_not_mention_ssl_cert_file() {
-        let message = network_message(&ureq::Error::ConnectionFailed, "https://idx/pkg/");
+    fn a_tls_failure_with_a_ca_bundle_names_the_bundle() {
+        let trust = Trust::WithExtra(CaBundle {
+            path: PathBuf::from("/certs/corp.pem"),
+            origin: "PIP_CERT".to_owned(),
+        });
+        let message = tls_message("UnknownIssuer", "https://idx/pkg/", &trust);
+        assert!(message.contains("/certs/corp.pem (from PIP_CERT)"));
+        assert!(message.contains("intermediate"));
+    }
+
+    #[test]
+    fn a_rustls_error_wrapped_in_io_counts_as_tls() {
+        let wrapped = std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer),
+        );
+        let message = network_message(
+            &ureq::Error::Io(wrapped),
+            "https://idx/pkg/",
+            &Trust::Bundled,
+        );
+        assert!(message.starts_with("TLS verification failed"), "{message}");
+    }
+
+    #[test]
+    fn a_plain_connection_failure_does_not_mention_certificates() {
+        let message = network_message(
+            &ureq::Error::ConnectionFailed,
+            "https://idx/pkg/",
+            &Trust::Bundled,
+        );
         assert!(!message.contains("SSL_CERT_FILE"));
         assert!(message.contains("Could not reach"));
+    }
+
+    fn bundle(path: PathBuf) -> CaBundle {
+        CaBundle {
+            path,
+            origin: "--ca-cert".to_owned(),
+        }
+    }
+
+    #[test]
+    fn an_unusable_ca_bundle_fails_the_first_request_not_construction() {
+        let tmp = tempdir().expect("tempdir");
+        let empty = tmp.path().join("empty.pem");
+        fs::write(&empty, "not a certificate\n").expect("write");
+        for (path, expected) in [
+            (tmp.path().join("missing.pem"), "Cannot read CA bundle"),
+            (empty, "holds no PEM certificates"),
+        ] {
+            let mut client = HttpClient::new();
+            client.set_trust(&Trust::WithExtra(bundle(path)));
+            let error = client
+                .get("https://idx.invalid/simple/", None, None)
+                .expect_err("error");
+            assert!(error.to_string().contains(expected), "{error}");
+            assert!(error.to_string().contains("(from --ca-cert)"), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_ca_directory_adds_every_pem_file_in_it() {
+        let tmp = tempdir().expect("tempdir");
+        let ca = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tests/fixtures/tls/ca.pem");
+        fs::copy(&ca, tmp.path().join("corp.pem")).expect("copy");
+        fs::write(tmp.path().join("README"), "not a certificate\n").expect("write");
+        let RootCerts::Specific(certs) =
+            root_certs(&Trust::WithExtra(bundle(tmp.path().to_path_buf()))).expect("roots")
+        else {
+            panic!("expected specific roots");
+        };
+        assert_eq!(
+            certs.len(),
+            webpki_root_certs::TLS_SERVER_ROOT_CERTS.len() + 1
+        );
+        let empty = tempdir().expect("tempdir");
+        let error = root_certs(&Trust::WithExtra(bundle(empty.path().to_path_buf())))
+            .expect_err("no certificates");
+        assert!(error.contains("holds no PEM certificates"), "{error}");
+    }
+
+    #[test]
+    fn a_ca_bundle_adds_to_the_mozilla_roots() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tests/fixtures/tls/ca.pem");
+        let RootCerts::Specific(certs) =
+            root_certs(&Trust::WithExtra(bundle(path))).expect("roots")
+        else {
+            panic!("expected specific roots");
+        };
+        assert_eq!(
+            certs.len(),
+            webpki_root_certs::TLS_SERVER_ROOT_CERTS.len() + 1
+        );
     }
 
     #[test]

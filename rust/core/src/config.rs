@@ -8,7 +8,9 @@
 //! The project's own `[project.license]` (PEP 639) is read from `pyproject.toml` whatever
 //! the policy source, solely to feed the informational compatibility notes.
 
-use crate::detection::{canonical_name, known_categories, resolve_license_expression};
+use crate::detection::{
+    canonical_name, is_exception, known_categories, known_license_id, resolve_license_expression,
+};
 use crate::policy::Policy;
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
@@ -19,6 +21,33 @@ use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, TableLike, Value};
 pub const CONFIG_SECTION: [&str; 2] = ["tool", "trustedlicenses"];
 pub const STANDALONE_FILENAME: &str = "trustedlicenses.toml";
 pub const DOCS_URL: &str = "https://trustedlicenses.readthedocs.io/en/latest/usage/";
+
+/// What the project is for, as answered in the setup wizard. Informational: it never
+/// changes pass/fail.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UseCase {
+    Internal,
+    OpenSource,
+    Product,
+}
+
+impl UseCase {
+    pub const ALL: [Self; 3] = [Self::Internal, Self::OpenSource, Self::Product];
+
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Internal => "internal",
+            Self::OpenSource => "open-source",
+            Self::Product => "product",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|case| case.as_str() == value)
+    }
+}
 
 /// A config file misconfigures `trustedlicenses`.
 ///
@@ -248,14 +277,24 @@ pub fn load_policy(pyproject: &Path) -> Result<Policy, ConfigError> {
         (found.cloned().unwrap_or_default(), pyproject.to_path_buf())
     };
 
-    let allowed: Vec<&toml::Value> = section
-        .get("allowed-categories")
-        .and_then(toml::Value::as_array)
-        .map(|array| array.iter().collect())
-        .unwrap_or_default();
-    if allowed.is_empty() {
+    let allowed: Vec<&toml::Value> = match section.get("allowed-categories") {
+        None => Vec::new(),
+        Some(raw) => raw
+            .as_array()
+            .ok_or_else(|| {
+                invalid(format!(
+                    "{}: allowed-categories must be a list of category names, e.g.\n\n  \
+                     allowed-categories = [\"Permissive\", \"Public Domain\", \"Copyleft Limited\"]",
+                    section_source.display()
+                ))
+            })?
+            .iter()
+            .collect(),
+    };
+    let allowed_licenses = allowed_licenses(&section, &section_source)?;
+    if allowed.is_empty() && allowed_licenses.is_empty() {
         return Err(invalid(format!(
-            "{} needs a non-empty allowed-categories list, e.g.:\n\n  \
+            "{} needs a non-empty allowed-categories (or allowed-licenses) list, e.g.:\n\n  \
              allowed-categories = [\"Permissive\", \"Public Domain\", \"Copyleft Limited\"]\n\n\
              See {DOCS_URL} for the full category vocabulary.",
             section_source.display()
@@ -316,6 +355,7 @@ pub fn load_policy(pyproject: &Path) -> Result<Policy, ConfigError> {
             .filter_map(|c| c.as_str())
             .map(str::to_owned)
             .collect(),
+        allowed_licenses,
         ignored_packages,
         project_license_keys: project_license_keys(&document),
         trust_corrected_licenses: section
@@ -324,7 +364,89 @@ pub fn load_policy(pyproject: &Path) -> Result<Policy, ConfigError> {
             .unwrap_or(false),
         verified_packages: verified_packages(&section, &section_source)?,
         verified_statements: verified_statements(&section, &section_source)?,
+        use_case: use_case(&section, &section_source)?,
     })
+}
+
+fn allowed_licenses(section: &toml::Table, source: &Path) -> Result<BTreeSet<String>, ConfigError> {
+    let Some(raw) = section.get("allowed-licenses") else {
+        return Ok(BTreeSet::new());
+    };
+    let shape = || {
+        invalid(format!(
+            "{}: allowed-licenses must be a list of SPDX ids, e.g.\n\n  \
+             allowed-licenses = [\"MIT\", \"BSD-3-Clause\"]",
+            source.display()
+        ))
+    };
+    let ids: BTreeSet<String> = raw
+        .as_array()
+        .ok_or_else(shape)?
+        .iter()
+        .map(|id| id.as_str().map(str::to_owned).ok_or_else(shape))
+        .collect::<Result<_, _>>()?;
+    // A custom LicenseRef can't be checked, and pinning writes whatever was detected.
+    let problems: Vec<String> = ids.iter().filter_map(|id| license_id_problem(id)).collect();
+    if !problems.is_empty() {
+        return Err(invalid(format!(
+            "{}: unknown allowed-licenses {}. Use SPDX ids as spelled at https://spdx.org/licenses/.",
+            source.display(),
+            problems.join(", ")
+        )));
+    }
+    Ok(ids)
+}
+
+/// What's wrong with an `allowed-licenses` id, if anything. A custom `LicenseRef-` can't be
+/// checked; `X WITH Y` needs a license and an exception, each spelled canonically.
+fn license_id_problem(id: &str) -> Option<String> {
+    let spelled = |part: &str| known_license_id(part).filter(|canonical| *canonical == part);
+    if let Some((base, exception)) = id.split_once(" WITH ") {
+        let base_ok = base.starts_with("LicenseRef-")
+            || spelled(base).is_some_and(|canonical| !is_exception(canonical));
+        let exception_ok =
+            exception.starts_with("LicenseRef-") || spelled(exception).is_some_and(is_exception);
+        return (!(base_ok && exception_ok)).then(|| {
+            format!(
+                "{} (expected a license, \" WITH \", and an exception)",
+                py_repr(id)
+            )
+        });
+    }
+    if id.starts_with("LicenseRef-") {
+        return None;
+    }
+    match known_license_id(id) {
+        Some(canonical) if is_exception(canonical) => Some(format!(
+            "{} (an exception, not a license: write it with the license it modifies, \
+             e.g. \"GPL-2.0-only WITH {canonical}\")",
+            py_repr(id)
+        )),
+        Some(canonical) if canonical == id => None,
+        Some(canonical) => Some(format!("{} (did you mean \"{canonical}\"?)", py_repr(id))),
+        None => Some(py_repr(id)),
+    }
+}
+
+fn use_case(section: &toml::Table, source: &Path) -> Result<Option<UseCase>, ConfigError> {
+    let Some(raw) = section.get("use-case") else {
+        return Ok(None);
+    };
+    let known = UseCase::ALL
+        .iter()
+        .map(|case| format!("\"{}\"", case.as_str()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    raw.as_str()
+        .and_then(UseCase::parse)
+        .map(Some)
+        .ok_or_else(|| {
+            invalid(format!(
+                "{}: use-case must be one of {known}, not {}.",
+                source.display(),
+                display_value(raw)
+            ))
+        })
 }
 
 fn allow_unlicensed(section: &toml::Table, source: &Path) -> Result<bool, ConfigError> {
@@ -410,12 +532,80 @@ pub fn write_policy(
     pyproject: &Path,
     allowed_categories: &[String],
     ignored_packages: &[String],
+    use_case: Option<UseCase>,
     standalone: bool,
 ) -> Result<PathBuf, ConfigError> {
+    write_new_policy(
+        pyproject,
+        &NewPolicy {
+            allowed_categories,
+            pinned_licenses: None,
+            ignored_packages,
+            use_case,
+        },
+        standalone,
+    )
+}
+
+/// What the setup wizard writes. With `pinned_licenses`, the policy lists those as
+/// `allowed-licenses` instead of `allowed_categories`.
+pub struct NewPolicy<'a> {
+    pub allowed_categories: &'a [String],
+    pub pinned_licenses: Option<&'a BTreeSet<String>>,
+    pub ignored_packages: &'a [String],
+    pub use_case: Option<UseCase>,
+}
+
+impl NewPolicy<'_> {
+    fn allowance(&self) -> (&'static str, Item) {
+        match self.pinned_licenses {
+            Some(licenses) => (
+                "allowed-licenses",
+                Item::Value(Value::Array(licenses_array(licenses))),
+            ),
+            None => (
+                "allowed-categories",
+                Item::Value(string_array(self.allowed_categories).into()),
+            ),
+        }
+    }
+}
+
+/// One id per line: a pinned list is long, and a reviewer reads its diff line by line.
+fn licenses_array(licenses: &BTreeSet<String>) -> Array {
+    let ids: Vec<String> = licenses.iter().cloned().collect();
+    let mut array = string_array(&ids);
+    for value in array.iter_mut() {
+        value.decor_mut().set_prefix("\n    ");
+    }
+    array.set_trailing("\n");
+    array.set_trailing_comma(true);
+    array
+}
+
+/// Write a new policy in one go, so a failure leaves nothing half-written.
+///
+/// # Errors
+///
+/// As for [`write_policy`].
+pub fn write_new_policy(
+    pyproject: &Path,
+    policy: &NewPolicy<'_>,
+    standalone: bool,
+) -> Result<PathBuf, ConfigError> {
+    let NewPolicy {
+        ignored_packages,
+        use_case,
+        ..
+    } = *policy;
+    let (allowance_key, allowance) = policy.allowance();
     if standalone {
         let target = standalone_path(pyproject);
         let mut document = DocumentMut::new();
-        document["allowed-categories"] = Item::Value(string_array(allowed_categories).into());
+        if let Some(case) = use_case {
+            document["use-case"] = Item::Value(case.as_str().into());
+        }
+        document[allowance_key] = allowance;
         if !ignored_packages.is_empty() {
             document["ignored-packages"] = Item::Value(string_array(ignored_packages).into());
         }
@@ -432,7 +622,10 @@ pub fn write_policy(
 
     let (mut document, original) = parse_document(pyproject)?;
     let mut section = Table::new();
-    section["allowed-categories"] = Item::Value(string_array(allowed_categories).into());
+    if let Some(case) = use_case {
+        section["use-case"] = Item::Value(case.as_str().into());
+    }
+    section[allowance_key] = allowance;
     if !ignored_packages.is_empty() {
         section["ignored-packages"] = Item::Value(string_array(ignored_packages).into());
     }
@@ -724,6 +917,8 @@ pub struct CorrectionTrust {
 pub struct PolicyAdditions {
     pub ignored_packages: Vec<String>,
     pub allowed_categories: Vec<String>,
+    /// SPDX ids for `allowed-licenses`, for every package.
+    pub allowed_licenses: Vec<String>,
     /// `(package, SPDX id)` pairs for `accepted-licenses`.
     pub accepted_licenses: Vec<(String, String)>,
     /// Sets `allow-unlicensed = true`.
@@ -745,6 +940,10 @@ pub fn add_to_policy(path: &Path, additions: &PolicyAdditions) -> Result<(), Con
         let section = policy_table(&mut document, path)?;
         if !additions.allowed_categories.is_empty() {
             extend_unique(section, "allowed-categories", &additions.allowed_categories)?;
+        }
+        if !additions.allowed_licenses.is_empty() {
+            extend_unique(section, "allowed-licenses", &additions.allowed_licenses)?;
+            keep_one_per_line(section, "allowed-licenses");
         }
         if !additions.ignored_packages.is_empty() {
             extend_ignored_packages(section, &additions.ignored_packages, &additions.reasons)?;
@@ -768,6 +967,158 @@ pub fn add_to_policy(path: &Path, additions: &PolicyAdditions) -> Result<(), Con
         }
     }
     fs::write(path, document.to_string()).map_err(|error| io_error(path, &error))
+}
+
+/// `[project].name` from a `pyproject.toml`, if it has one.
+#[must_use]
+pub fn project_name(pyproject: &Path) -> Option<String> {
+    read_toml(pyproject)
+        .ok()?
+        .get("project")?
+        .get("name")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+/// The reason recorded beside each `ignored-packages` entry, as the review writes it:
+/// `"pkg", # reason`. Best effort: a policy that can't be read just has no reasons.
+#[must_use]
+pub fn ignored_reasons(pyproject: &Path) -> std::collections::BTreeMap<String, String> {
+    let path = policy_source(pyproject);
+    let mut reasons = std::collections::BTreeMap::new();
+    let Ok((mut document, _)) = parse_document(&path) else {
+        return reasons;
+    };
+    let Ok(section) = policy_table(&mut document, &path) else {
+        return reasons;
+    };
+    let Some(array) = section.get("ignored-packages").and_then(Item::as_array) else {
+        return reasons;
+    };
+    // A comment after an element's comma parses into the next element's prefix, or into
+    // the array's trailing text after the last one.
+    let followers: Vec<Option<&str>> = array
+        .iter()
+        .skip(1)
+        .map(|value| value.decor().prefix().and_then(|raw| raw.as_str()))
+        .chain(std::iter::once(array.trailing().as_str()))
+        .collect();
+    for (value, follower) in array.iter().zip(followers) {
+        // Without a trailing comma, the last element's comment is its own suffix.
+        let own = value.decor().suffix().and_then(|raw| raw.as_str());
+        let comment = own
+            .filter(|text| text.contains('#'))
+            .or(follower)
+            .and_then(|text| text.lines().next())
+            .and_then(|line| line.split_once('#'))
+            .map(|(_, comment)| comment.trim())
+            .filter(|comment| !comment.is_empty());
+        if let (Some(name), Some(comment)) = (value.as_str(), comment) {
+            reasons.insert(canonical_name(name), comment.to_owned());
+        }
+    }
+    reasons
+}
+
+/// New entries in a one-per-line array (as `pin` writes it) follow the same layout.
+fn keep_one_per_line(section: &mut dyn TableLike, key: &str) {
+    let Some(array) = section.get_mut(key).and_then(Item::as_array_mut) else {
+        return;
+    };
+    let multiline = array
+        .iter()
+        .next()
+        .and_then(|value| value.decor().prefix().and_then(|raw| raw.as_str()))
+        .is_some_and(|prefix| prefix.contains('\n'));
+    if !multiline {
+        return;
+    }
+    for value in array.iter_mut() {
+        if !value
+            .decor()
+            .prefix()
+            .and_then(|raw| raw.as_str())
+            .is_some_and(|prefix| prefix.contains('\n'))
+        {
+            value.decor_mut().set_prefix("\n    ");
+        }
+    }
+    array.set_trailing("\n");
+    array.set_trailing_comma(true);
+}
+
+/// Replace a policy's `allowed-categories` with `licenses` as `allowed-licenses`, keeping
+/// everything else in the file, comments included, as it was.
+///
+/// # Errors
+///
+/// `Invalid` when `licenses` is empty (the policy would allow nothing), when the file has no
+/// policy table, or on an I/O or parse failure.
+pub fn pin_policy(path: &Path, licenses: &BTreeSet<String>) -> Result<(), ConfigError> {
+    if licenses.is_empty() {
+        return Err(invalid(format!(
+            "{}: no licenses to pin -- nothing currently passes through allowed-categories.",
+            path.display()
+        )));
+    }
+    let (mut document, _) = parse_document(path)?;
+    {
+        let section = policy_table(&mut document, path)?;
+        let mut merged = licenses.clone();
+        if let Some(existing) = section.get("allowed-licenses") {
+            let array = existing
+                .as_array()
+                .ok_or_else(|| not_an_array("allowed-licenses"))?;
+            merged.extend(array.iter().filter_map(|id| id.as_str().map(str::to_owned)));
+        }
+        replace_categories(section, Value::Array(licenses_array(&merged)));
+    }
+    fs::write(path, document.to_string()).map_err(|error| io_error(path, &error))
+}
+
+/// Put `licenses` where `allowed-categories` was, keeping the comments around it: the key's
+/// leading comment lines and the value's trailing comment.
+fn replace_categories(section: &mut dyn TableLike, mut licenses: Value) {
+    let old_value_suffix = section
+        .get("allowed-categories")
+        .and_then(Item::as_value)
+        .and_then(|value| value.decor().suffix().cloned());
+    let old_key_decor = section
+        .key("allowed-categories")
+        .map(|key| key.leaf_decor().clone());
+    if let Some(suffix) = old_value_suffix {
+        licenses.decor_mut().set_suffix(suffix);
+    }
+    if section.get("allowed-licenses").is_some() || old_key_decor.is_none() {
+        section.remove("allowed-categories");
+        section.insert("allowed-licenses", Item::Value(licenses));
+        return;
+    }
+    // Rebuild the table in order so the new key takes the old one's place.
+    let entries: Vec<(toml_edit::Key, Item)> = section
+        .iter()
+        .map(|(name, _)| name.to_owned())
+        .collect::<Vec<_>>()
+        .into_iter()
+        .filter_map(|name| {
+            let key = section.key(&name)?.clone();
+            let item = section.remove(&name)?;
+            Some((key, item))
+        })
+        .collect();
+    for (key, item) in entries {
+        if key.get() == "allowed-categories" {
+            let mut renamed = toml_edit::Key::new("allowed-licenses");
+            if let Some(decor) = &old_key_decor {
+                *renamed.leaf_decor_mut() = decor.clone();
+            }
+            section
+                .entry_format(&renamed)
+                .or_insert(Item::Value(licenses.clone()));
+        } else {
+            section.entry_format(&key).or_insert(item);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1068,6 +1419,7 @@ mod tests {
             &path,
             &strings(&["Permissive", "Public Domain"]),
             &strings(&["mypy-extensions"]),
+            None,
             false,
         )
         .expect("write");
@@ -1090,7 +1442,7 @@ mod tests {
     fn write_policy_omits_an_empty_ignored_packages() {
         let tmp = tempdir().expect("tempdir");
         let path = pyproject(&tmp, "[project]\nname = \"x\"\n");
-        write_policy(&path, &strings(&["Permissive"]), &[], false).expect("write");
+        write_policy(&path, &strings(&["Permissive"]), &[], None, false).expect("write");
         assert!(!text(&path).contains("ignored-packages"));
     }
 
@@ -1098,8 +1450,14 @@ mod tests {
     fn write_policy_writes_a_standalone_file() {
         let tmp = tempdir().expect("tempdir");
         let path = tmp.path().join("pyproject.toml");
-        let written =
-            write_policy(&path, &strings(&["Permissive"]), &strings(&["a"]), true).expect("write");
+        let written = write_policy(
+            &path,
+            &strings(&["Permissive"]),
+            &strings(&["a"]),
+            None,
+            true,
+        )
+        .expect("write");
         assert_eq!(written, tmp.path().join(STANDALONE_FILENAME));
         assert_eq!(
             text(&written),
@@ -1114,6 +1472,7 @@ mod tests {
             &tmp.path().join("pyproject.toml"),
             &strings(&["Permissive"]),
             &[],
+            None,
             false,
         )
         .expect_err("error");
@@ -1495,7 +1854,7 @@ mod tests {
     fn error_messages_match_the_python_implementation() {
         let golden: &[(&str, &str)] = &[
             ("[tool.other]\nfoo = 1\n", "Neither <DIR>/trustedlicenses.toml nor a [tool.trustedlicenses] table in <DIR>/pyproject.toml exists yet. Add one to enable enforcement, e.g.:\n\n  [tool.trustedlicenses]\n  allowed-categories = [\"Permissive\", \"Public Domain\", \"Copyleft Limited\"]\n\nSee https://trustedlicenses.readthedocs.io/en/latest/usage/ for the full guide, or run `trustedlicenses` interactively to set this up with guided prompts."),
-            ("[tool.trustedlicenses]\nignored-packages = []\n", "<DIR>/pyproject.toml needs a non-empty allowed-categories list, e.g.:\n\n  allowed-categories = [\"Permissive\", \"Public Domain\", \"Copyleft Limited\"]\n\nSee https://trustedlicenses.readthedocs.io/en/latest/usage/ for the full category vocabulary."),
+            ("[tool.trustedlicenses]\nignored-packages = []\n", "<DIR>/pyproject.toml needs a non-empty allowed-categories (or allowed-licenses) list, e.g.:\n\n  allowed-categories = [\"Permissive\", \"Public Domain\", \"Copyleft Limited\"]\n\nSee https://trustedlicenses.readthedocs.io/en/latest/usage/ for the full category vocabulary."),
             ("[tool.trustedlicenses]\nallowed-categories = [\"Permissiv\", \"Another\", \"it's\"]\n", "<DIR>/pyproject.toml: unknown allowed-categories 'Another', 'Permissiv', \"it's\". Known categories: CLA, Commercial, Copyleft, Copyleft Limited, Free Restricted, Patent License, Permissive, Proprietary Free, Public Domain, Source-available.\nSee https://trustedlicenses.readthedocs.io/en/latest/usage/ for the full category vocabulary."),
             ("[tool.trustedlicenses]\nallowed-categories = [\"Permissive\"]\n[tool.trustedlicenses.verified-packages]\ncatboost = {statement = \"x\"}\n", "<DIR>/pyproject.toml: verified-packages.catboost needs both \"statement\" and \"spdx-id\"."),
             ("[tool.trustedlicenses]\nallowed-categories = [\"Permissive\"]\nverified-packages = [\"x\"]\n", "<DIR>/pyproject.toml: verified-packages must be a table of package name -> { statement, spdx-id }."),
@@ -1646,6 +2005,278 @@ mod tests {
         assert!(
             written.contains("allow-unlicensed = true # review in Q3"),
             "{written}"
+        );
+    }
+
+    #[test]
+    fn allowed_licenses_alone_is_a_policy_and_use_case_is_read() {
+        let policy = load(
+            "[tool.trustedlicenses]\nuse-case = \"product\"\nallowed-licenses = [\"MIT\", \"MPL-2.0\"]\n",
+        )
+        .expect("policy");
+        assert!(policy.allowed_categories.is_empty());
+        assert_eq!(policy.allowed_licenses, set(&["MIT", "MPL-2.0"]));
+        assert_eq!(policy.use_case, Some(UseCase::Product));
+    }
+
+    #[test]
+    fn malformed_allowed_licenses_and_use_case_are_plain_errors() {
+        let error =
+            load("[tool.trustedlicenses]\nallowed-licenses = \"MIT\"\n").expect_err("error");
+        assert!(error
+            .message()
+            .contains("allowed-licenses must be a list of SPDX ids"));
+        let error = load(
+            "[tool.trustedlicenses]\nallowed-categories = [\"Permissive\"]\nuse-case = \"saas\"\n",
+        )
+        .expect_err("error");
+        assert!(
+            error.message().contains(
+                "use-case must be one of \"internal\", \"open-source\", \"product\", not saas."
+            ),
+            "{}",
+            error.message()
+        );
+    }
+
+    #[test]
+    fn write_policy_records_the_use_case() {
+        let tmp = tempdir().expect("tempdir");
+        let path = pyproject(&tmp, "[project]\nname = 'x'\n");
+        write_policy(
+            &path,
+            &strings(&["Permissive"]),
+            &[],
+            Some(UseCase::Internal),
+            false,
+        )
+        .expect("write");
+        assert_eq!(
+            load_policy(&path).expect("policy").use_case,
+            Some(UseCase::Internal)
+        );
+    }
+
+    #[test]
+    fn pinning_replaces_the_categories_and_keeps_the_rest_of_the_file() {
+        let tmp = tempdir().expect("tempdir");
+        let path = pyproject(
+            &tmp,
+            "[project]\nname = \"x\"\n# keep me\n\n[tool.trustedlicenses]\n\
+             allowed-categories = [\"Permissive\"]\nallowed-licenses = [\"MPL-2.0\"]\n\
+             ignored-packages = [\"a\"] # reviewed\n",
+        );
+        pin_policy(&path, &set(&["MIT", "BSD-3-Clause"])).expect("pin");
+        let written = fs::read_to_string(&path).expect("read");
+        assert!(written.contains("# keep me"), "{written}");
+        assert!(
+            written.contains("ignored-packages = [\"a\"] # reviewed"),
+            "{written}"
+        );
+        assert!(!written.contains("allowed-categories"), "{written}");
+        assert!(
+            written.contains(
+                "allowed-licenses = [\n    \"BSD-3-Clause\",\n    \"MIT\",\n    \"MPL-2.0\",\n]"
+            ),
+            "{written}"
+        );
+        let policy = load_policy(&path).expect("policy");
+        assert_eq!(
+            policy.allowed_licenses,
+            set(&["BSD-3-Clause", "MIT", "MPL-2.0"])
+        );
+    }
+
+    #[test]
+    fn pinning_nothing_is_refused_and_leaves_the_file_alone() {
+        let tmp = tempdir().expect("tempdir");
+        let path = pyproject(&tmp, PERMISSIVE);
+        let error = pin_policy(&path, &BTreeSet::new()).expect_err("error");
+        assert!(error.message().contains("no licenses to pin"));
+        assert_eq!(fs::read_to_string(&path).expect("read"), PERMISSIVE);
+    }
+
+    #[test]
+    fn ignored_reasons_read_back_what_the_review_wrote() {
+        let tmp = tempdir().expect("tempdir");
+        let path = pyproject(&tmp, PERMISSIVE);
+        let additions = PolicyAdditions {
+            ignored_packages: strings(&["first", "second", "third"]),
+            reasons: HashMap::from([
+                (
+                    "first".to_owned(),
+                    "detected X -- accepted 2026-09-18".to_owned(),
+                ),
+                ("third".to_owned(), "legal reviewed".to_owned()),
+            ]),
+            ..PolicyAdditions::default()
+        };
+        add_to_policy(&path, &additions).expect("add");
+        let reasons = ignored_reasons(&path);
+        assert_eq!(
+            reasons,
+            std::collections::BTreeMap::from([
+                (
+                    "first".to_owned(),
+                    "detected X -- accepted 2026-09-18".to_owned()
+                ),
+                ("third".to_owned(), "legal reviewed".to_owned()),
+            ]),
+            "{}",
+            fs::read_to_string(&path).expect("read")
+        );
+        assert_eq!(project_name(&path), None);
+        let named = pyproject(&tmp, "[project]\nname = \"demo\"\n");
+        assert_eq!(project_name(&named).as_deref(), Some("demo"));
+    }
+
+    #[test]
+    fn pinning_keeps_the_comments_and_place_of_allowed_categories() {
+        let tmp = tempdir().expect("tempdir");
+        let path = pyproject(
+            &tmp,
+            "[project]\nname = \"x\"\n\n[tool.trustedlicenses]\nuse-case = \"product\"\n\
+             # agreed with legal, 2026-11\nallowed-categories = [\"Permissive\"] # see JIRA-1\n\
+             ignored-packages = [\"a\"]\n",
+        );
+        pin_policy(&path, &set(&["MIT"])).expect("pin");
+        let written = fs::read_to_string(&path).expect("read");
+        assert!(
+            written.contains(
+                "use-case = \"product\"\n# agreed with legal, 2026-11\nallowed-licenses = [\n    \"MIT\",\n] # see JIRA-1\nignored-packages"
+            ),
+            "{written}"
+        );
+    }
+
+    #[test]
+    fn pinning_a_standalone_file_keeps_its_header_comment() {
+        let tmp = tempdir().expect("tempdir");
+        let path = tmp.path().join(STANDALONE_FILENAME);
+        fs::write(
+            &path,
+            "# Licenses for the data pipeline\nallowed-categories = [\"Permissive\"]\n",
+        )
+        .expect("write");
+        pin_policy(&path, &set(&["MIT"])).expect("pin");
+        let written = fs::read_to_string(&path).expect("read");
+        assert!(
+            written.starts_with("# Licenses for the data pipeline\nallowed-licenses = ["),
+            "{written}"
+        );
+    }
+
+    #[test]
+    fn allowed_categories_that_isnt_a_list_is_an_error_even_with_allowed_licenses() {
+        let error = load(
+            "[tool.trustedlicenses]\nallowed-categories = \"Copyleft Limited\"\nallowed-licenses = [\"MIT\"]\n",
+        )
+        .expect_err("error");
+        assert!(
+            error
+                .message()
+                .contains("allowed-categories must be a list"),
+            "{}",
+            error.message()
+        );
+    }
+
+    #[test]
+    fn unknown_allowed_licenses_are_errors_but_licenserefs_are_not() {
+        let error =
+            load("[tool.trustedlicenses]\nallowed-licenses = [\"mit\", \"Not-A-License\"]\n")
+                .expect_err("error");
+        let message = error.message();
+        assert!(
+            message.contains("'mit' (did you mean \"MIT\"?)"),
+            "{message}"
+        );
+        assert!(message.contains("'Not-A-License'"), "{message}");
+        let policy =
+            load("[tool.trustedlicenses]\nallowed-licenses = [\"LicenseRef-acme-internal\"]\n")
+                .expect("policy");
+        assert_eq!(policy.allowed_licenses, set(&["LicenseRef-acme-internal"]));
+    }
+
+    #[test]
+    fn ignored_reasons_read_a_comment_on_the_last_entry_without_a_trailing_comma() {
+        let tmp = tempdir().expect("tempdir");
+        let path = pyproject(
+            &tmp,
+            "[tool.trustedlicenses]\nallowed-categories = [\"Permissive\"]\nignored-packages = [\n    \"a\", # first\n    \"six\" # last\n]\n",
+        );
+        assert_eq!(
+            ignored_reasons(&path),
+            std::collections::BTreeMap::from([
+                ("a".to_owned(), "first".to_owned()),
+                ("six".to_owned(), "last".to_owned()),
+            ])
+        );
+    }
+
+    #[test]
+    fn a_new_policy_can_be_written_pinned_in_one_go() {
+        let tmp = tempdir().expect("tempdir");
+        let path = pyproject(&tmp, "[project]\nname = 'x'\n");
+        let licenses = set(&["MIT", "BSD-3-Clause"]);
+        write_new_policy(
+            &path,
+            &NewPolicy {
+                allowed_categories: &strings(&["Permissive"]),
+                pinned_licenses: Some(&licenses),
+                ignored_packages: &[],
+                use_case: Some(UseCase::Product),
+            },
+            false,
+        )
+        .expect("write");
+        let policy = load_policy(&path).expect("policy");
+        assert!(policy.allowed_categories.is_empty());
+        assert_eq!(policy.allowed_licenses, licenses);
+    }
+
+    #[test]
+    fn licenses_added_to_a_pinned_list_stay_one_per_line() {
+        let tmp = tempdir().expect("tempdir");
+        let path = pyproject(&tmp, PERMISSIVE);
+        pin_policy(&path, &set(&["MIT"])).expect("pin");
+        let additions = PolicyAdditions {
+            allowed_licenses: strings(&["Apache-2.0"]),
+            ..PolicyAdditions::default()
+        };
+        add_to_policy(&path, &additions).expect("add");
+        let written = fs::read_to_string(&path).expect("read");
+        assert!(
+            written.contains("allowed-licenses = [\n    \"MIT\",\n    \"Apache-2.0\",\n]"),
+            "{written}"
+        );
+    }
+
+    #[test]
+    fn allowed_licenses_take_with_expressions_but_not_bare_exceptions() {
+        let policy = load(
+            "[tool.trustedlicenses]\nallowed-licenses = [\"GPL-2.0-only WITH Classpath-exception-2.0\"]\n",
+        )
+        .expect("policy");
+        assert_eq!(
+            policy.allowed_licenses,
+            set(&["GPL-2.0-only WITH Classpath-exception-2.0"])
+        );
+        let error = load("[tool.trustedlicenses]\nallowed-licenses = [\"LLVM-exception\"]\n")
+            .expect_err("error");
+        assert!(
+            error.message().contains("an exception, not a license"),
+            "{}",
+            error.message()
+        );
+        let error = load(
+            "[tool.trustedlicenses]\nallowed-licenses = [\"LLVM-exception WITH GPL-2.0-only\"]\n",
+        )
+        .expect_err("error");
+        assert!(
+            error.message().contains("expected a license"),
+            "{}",
+            error.message()
         );
     }
 }

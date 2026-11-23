@@ -7,6 +7,7 @@ pub mod index_discovery;
 pub mod match_cache;
 pub mod matcher;
 pub mod policy;
+pub mod report;
 pub mod sources;
 
 pub use matcher::scan_license_text;

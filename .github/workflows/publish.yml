@@ -62,6 +62,18 @@ jobs:
           manylinux: auto
           docker-options: ${{ matrix.docker_options }}
 
+      # Free-threaded 3.15+ loads only abi3t (PEP 803); maturin needs the interpreter's name, not the
+      # interpreter. Windows names it `_rust.pyd` like the abi3 build, so it ships abi3 alone there.
+      - name: Build the extension module for free-threaded Python
+        if: runner.os != 'Windows'
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release -i python3.15t --features pyo3/abi3t-py315 --out ../../extension-dist
+          working-directory: rust/python
+          manylinux: auto
+          docker-options: ${{ matrix.docker_options }}
+
       - name: Stage the extension module
         shell: python
         run: |
@@ -88,6 +100,18 @@ jobs:
         if: contains(fromJSON('["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "aarch64-apple-darwin"]'), matrix.target)
         shell: bash
         run: python scripts/check_wheel.py dist
+
+      # The free-threaded build loads only the abi3t extension, which nothing else here imports.
+      - name: Set up uv for the free-threaded check
+        if: contains(fromJSON('["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "aarch64-apple-darwin"]'), matrix.target)
+        uses: astral-sh/setup-uv@v6
+
+      - name: Check the wheel on free-threaded Python 3.15
+        if: contains(fromJSON('["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "aarch64-apple-darwin"]'), matrix.target)
+        shell: bash
+        run: |
+          uv python install 3.15t
+          python scripts/check_wheel.py dist "$(uv python find --no-project 3.15t)"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -250,7 +274,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: [ '3.11', '3.12', '3.13', '3.14', '3.15' ]
+        python-version: [ '3.11', '3.12', '3.13', '3.14', '3.15', '3.15t' ]
     steps:
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5

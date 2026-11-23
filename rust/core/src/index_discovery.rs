@@ -9,6 +9,7 @@
 //! labelled as an assumption. Credentials are deliberately not handled here.
 
 use crate::detection::canonical_name;
+use crate::index::CaBundle;
 use crate::sources::lock::{parse_pipfile_lock, parse_poetry_lock, parse_uv_lock};
 use crate::sources::{LockedPackage, PackageSource};
 use std::collections::HashMap;
@@ -38,11 +39,18 @@ pub struct DiscoveryContext {
 impl DiscoveryContext {
     #[must_use]
     pub fn from_process() -> Self {
+        Self::from_env(std::env::vars().collect())
+    }
+
+    #[must_use]
+    pub fn from_env(env: HashMap<String, String>) -> Self {
+        let home = env
+            .get("HOME")
+            .or_else(|| env.get("USERPROFILE"))
+            .map(PathBuf::from);
         Self {
-            env: std::env::vars().collect(),
-            home: std::env::var_os("HOME")
-                .or_else(|| std::env::var_os("USERPROFILE"))
-                .map(PathBuf::from),
+            env,
+            home,
             include_system: true,
         }
     }
@@ -187,10 +195,11 @@ fn pip_conf_paths(context: &DiscoveryContext) -> Vec<PathBuf> {
     paths
 }
 
-/// The `index-url` of a `[global]` or `[install]` section, preferring `[global]`. `None`
-/// for a file that does not parse as INI, which is skipped like any unparseable config.
-fn pip_conf_index(text: &str) -> Option<String> {
-    let mut sections: HashMap<String, HashMap<String, String>> = HashMap::new();
+type PipConfSections = HashMap<String, HashMap<String, String>>;
+
+/// `None` for a file that does not parse as INI, which is skipped like any unparseable config.
+fn pip_conf_sections(text: &str) -> Option<PipConfSections> {
+    let mut sections = PipConfSections::new();
     let mut current: Option<String> = None;
     for line in text.lines() {
         let trimmed = line.trim();
@@ -211,20 +220,68 @@ fn pip_conf_index(text: &str) -> Option<String> {
             .or_default()
             .insert(key.trim().to_lowercase(), value.trim().to_owned());
     }
+    Some(sections)
+}
+
+/// `key` from a `[global]` or `[install]` section, preferring `[global]`.
+fn pip_conf_option(
+    sections: &PipConfSections,
+    key: &str,
+    usable: impl Fn(&str) -> bool,
+) -> Option<String> {
     ["global", "install"].iter().find_map(|section| {
         sections
             .get(*section)
-            .and_then(|options| options.get("index-url"))
-            .filter(|url| is_url(url))
+            .and_then(|options| options.get(key))
+            .filter(|value| usable(value))
             .cloned()
     })
 }
 
-fn from_pip_conf(context: &DiscoveryContext) -> Option<String> {
+fn pip_conf_index(text: &str) -> Option<String> {
+    pip_conf_option(&pip_conf_sections(text)?, "index-url", is_url)
+}
+
+fn first_in_pip_conf(
+    context: &DiscoveryContext,
+    pick: impl Fn(&str) -> Option<String>,
+) -> Option<String> {
     pip_conf_paths(context).iter().find_map(|path| {
         let bytes = fs::read(path).ok()?;
-        pip_conf_index(std::str::from_utf8(&bytes).ok()?)
+        pick(std::str::from_utf8(&bytes).ok()?)
     })
+}
+
+fn from_pip_conf(context: &DiscoveryContext) -> Option<String> {
+    first_in_pip_conf(context, pip_conf_index)
+}
+
+/// The CA bundle the environment points at. First set wins: `SSL_CERT_FILE`, `PIP_CERT`,
+/// `cert` in `pip.conf`, then `REQUESTS_CA_BUNDLE`.
+#[must_use]
+pub fn discover_ca_bundle(context: &DiscoveryContext) -> Option<CaBundle> {
+    let from_env = |key: &str| {
+        context
+            .env
+            .get(key)
+            .filter(|path| !path.is_empty())
+            .map(|path| CaBundle {
+                path: PathBuf::from(path),
+                origin: key.to_owned(),
+            })
+    };
+    from_env("SSL_CERT_FILE")
+        .or_else(|| from_env("PIP_CERT"))
+        .or_else(|| {
+            first_in_pip_conf(context, |text| {
+                pip_conf_option(&pip_conf_sections(text)?, "cert", |path| !path.is_empty())
+            })
+            .map(|path| CaBundle {
+                path: PathBuf::from(path),
+                origin: "cert in pip.conf".to_owned(),
+            })
+        })
+        .or_else(|| from_env("REQUESTS_CA_BUNDLE"))
 }
 
 type Finder<'a> = Box<dyn Fn() -> Option<String> + 'a>;
@@ -561,5 +618,52 @@ mod tests {
         );
         assert_eq!(pip_conf_index("index-url = https://x/simple\n"), None);
         assert_eq!(pip_conf_index("[global]\nno delimiter here\n"), None);
+    }
+
+    fn ca_bundle_with(env: &[(&str, &str)]) -> Option<(String, String)> {
+        let context = DiscoveryContext {
+            env: env
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect(),
+            ..DiscoveryContext::default()
+        };
+        discover_ca_bundle(&context)
+            .map(|bundle| (bundle.path.display().to_string(), bundle.origin))
+    }
+
+    #[test]
+    fn ca_bundle_sources_in_order() {
+        let tmp = tempdir().expect("tempdir");
+        write(tmp.path(), "pip.conf", "[global]\ncert = /conf.pem\n");
+        let conf = tmp.path().join("pip.conf");
+        let conf = conf.to_str().expect("utf8");
+        let all = [
+            ("SSL_CERT_FILE", "/ssl.pem"),
+            ("PIP_CERT", "/pip.pem"),
+            ("PIP_CONFIG_FILE", conf),
+            ("REQUESTS_CA_BUNDLE", "/requests.pem"),
+        ];
+        let expected = [
+            ("/ssl.pem", "SSL_CERT_FILE"),
+            ("/pip.pem", "PIP_CERT"),
+            ("/conf.pem", "cert in pip.conf"),
+            ("/requests.pem", "REQUESTS_CA_BUNDLE"),
+        ];
+        for (skip, (path, origin)) in expected.iter().enumerate() {
+            assert_eq!(
+                ca_bundle_with(&all[skip..]),
+                Some(((*path).to_owned(), (*origin).to_owned()))
+            );
+        }
+        assert_eq!(ca_bundle_with(&[]), None);
+    }
+
+    #[test]
+    fn an_empty_ca_bundle_setting_is_ignored() {
+        assert_eq!(
+            ca_bundle_with(&[("SSL_CERT_FILE", ""), ("REQUESTS_CA_BUNDLE", "/r.pem")]),
+            Some(("/r.pem".to_owned(), "REQUESTS_CA_BUNDLE".to_owned()))
+        );
     }
 }

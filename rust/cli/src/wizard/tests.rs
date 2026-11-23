@@ -37,6 +37,11 @@ impl Script {
         }
     }
 
+    /// Initial setup: answers "What are you building?" with `use_case`, then `confirms`.
+    fn setting_up(use_case: &str, confirms: &[bool]) -> Self {
+        Self::choosing(confirms, &[use_case])
+    }
+
     fn text(&self) -> String {
         self.output.join("\n")
     }
@@ -145,7 +150,7 @@ fn run_writes_the_selected_categories_to_pyproject() {
     let (_tmp, pyproject) = project(BARE);
     // setup? yes; Permissive, Public Domain, Copyleft Limited yes; Copyleft no;
     // standalone? no; write? yes.
-    let mut io = Script::confirming(&[true, true, true, true, false, false, true]);
+    let mut io = Script::setting_up("p", &[true, true, true, true, false, false, true]);
     assert_eq!(setup(&mut io, &pyproject, &[]), Some(pyproject.clone()));
     let text = fs::read_to_string(&pyproject).expect("read");
     assert!(text.contains("[tool.trustedlicenses]"));
@@ -159,8 +164,10 @@ fn run_writes_the_selected_categories_to_pyproject() {
 fn run_asks_about_additional_detected_categories() {
     let (_tmp, pyproject) = project(BARE);
     let detected = [licence("somepkg", &["LicenseRef-x"], &["Proprietary Free"])];
-    let mut io = Script::confirming(&[true, true, true, true, false, false, true]);
-    io.extra_prompt = "Proprietary Free".to_owned();
+    let mut io = Script::choosing(
+        &[true, true, true, true, false, false, true],
+        &["p", "Proprietary Free"],
+    );
     assert_eq!(
         setup(&mut io, &pyproject, &detected),
         Some(pyproject.clone())
@@ -171,6 +178,105 @@ fn run_asks_about_additional_detected_categories() {
     assert!(io
         .text()
         .contains("Also detected in your environment: Proprietary Free."));
+    assert!(!io.text().contains("restrict use itself"));
+}
+
+#[test]
+fn run_explains_how_source_available_licenses_differ() {
+    let (_tmp, pyproject) = project(BARE);
+    let detected = [licence("buslpkg", &["BUSL-1.1"], &["Source-available"])];
+    let mut io = Script::setting_up("i", &[true]);
+    setup(&mut io, &pyproject, &detected);
+    let text = io.text();
+    assert!(text.contains("Also detected in your environment: Source-available."));
+    assert!(text.contains("some (BUSL, CC-BY-NC) restrict use even internally"));
+    assert!(text.contains("accept the package in the review after the check"));
+    assert!(!fs::read_to_string(&pyproject)
+        .expect("read")
+        .contains("Source-available"));
+}
+
+#[test]
+fn run_keeps_copyleft_off_by_default_and_hints_for_each_use_case() {
+    for (use_case, hint) in [
+        (
+            "i",
+            "AGPL does if you modify it and people use it over a network. Others here (OSL,",
+        ),
+        (
+            "o",
+            "For an open-source package: fine if your own project is GPL.",
+        ),
+        (
+            "p",
+            "For a product: shipping copies brings in GPL's full terms;",
+        ),
+    ] {
+        let (_tmp, pyproject) = project(BARE);
+        // Only "run setup?" is answered: every category takes its suggested default.
+        let mut io = Script::setting_up(use_case, &[true]);
+        assert_eq!(setup(&mut io, &pyproject, &[]), Some(pyproject.clone()));
+        let text = fs::read_to_string(&pyproject).expect("read");
+        assert!(text.contains("Copyleft Limited"), "{use_case}");
+        assert!(!text.contains("\"Copyleft\""), "{use_case}");
+        assert!(io.text().contains(hint), "{use_case}");
+    }
+}
+
+#[test]
+fn run_saves_the_use_case_and_keeps_categories_by_default() {
+    let (_tmp, pyproject) = project(BARE);
+    let detected = [licence("mitpkg", &["MIT"], &["Permissive"])];
+    let mut io = Script::setting_up("i", &[true]);
+    assert_eq!(
+        setup(&mut io, &pyproject, &detected),
+        Some(pyproject.clone())
+    );
+    let text = fs::read_to_string(&pyproject).expect("read");
+    assert!(text.contains("use-case = \"internal\""), "{text}");
+    assert!(text.contains("allowed-categories"), "{text}");
+    assert!(!text.contains("allowed-licenses"), "{text}");
+    assert!(io
+        .text()
+        .contains("These categories allow 1 license(s) in your environment now: MIT."));
+}
+
+#[test]
+fn run_pins_to_the_detected_licenses_when_asked() {
+    let (_tmp, pyproject) = project(BARE);
+    let detected = [
+        licence("mitpkg", &["MIT"], &["Permissive"]),
+        licence("gplpkg", &["GPL-3.0-only"], &["Copyleft"]),
+    ];
+    // setup; Permissive, Public Domain, Copyleft Limited yes; Copyleft no; pin yes;
+    // standalone no; write yes.
+    let mut io = Script::setting_up("p", &[true, true, true, true, false, true, false, true]);
+    assert_eq!(
+        setup(&mut io, &pyproject, &detected),
+        Some(pyproject.clone())
+    );
+    let policy = load_policy(&pyproject).expect("policy");
+    assert!(policy.allowed_categories.is_empty());
+    assert_eq!(policy.allowed_licenses, set(&["MIT"]));
+    assert_eq!(policy.use_case, Some(UseCase::Product));
+}
+
+#[test]
+fn run_does_not_offer_to_pin_when_nothing_would_be_pinned() {
+    let (_tmp, pyproject) = project(BARE);
+    let mut io = Script::setting_up("o", &[true]);
+    setup(&mut io, &pyproject, &[]);
+    assert!(!io.text().contains("Pin to these licenses"));
+}
+
+#[test]
+fn run_takes_a_use_case_by_its_first_letter_and_asks_again_otherwise() {
+    let (_tmp, pyproject) = project(BARE);
+    let mut io = Script::choosing(&[true], &["", "x", "  Internal tooling"]);
+    assert_eq!(setup(&mut io, &pyproject, &[]), Some(pyproject.clone()));
+    let text = io.text();
+    assert_eq!(text.matches("Type i, o or p (not sure? p).").count(), 2);
+    assert!(text.contains("For internal use:"));
 }
 
 #[test]
@@ -180,7 +286,7 @@ fn run_reports_the_detected_license_count_before_asking_anything() {
         licence("haslicense", &["MIT"], &["Permissive"]),
         failure("nolicense"),
     ];
-    let mut io = Script::confirming(&[false]);
+    let mut io = Script::setting_up("p", &[false]);
     setup(&mut io, &pyproject, &detected);
     assert!(io.output[0].contains("Detected licenses for 1 of 2 installed packages"));
 }
@@ -190,7 +296,7 @@ fn run_reports_per_category_counts_naming_one_or_two() {
     let (_tmp, pyproject) = project(BARE);
     let mut detected = vec![licence("gplpkg", &["GPL-3.0-only"], &["Copyleft"])];
     detected.extend((0..5).map(|i| licence(&format!("pkg{i}"), &["MIT"], &["Permissive"])));
-    let mut io = Script::confirming(&[true, false, false, false, false]);
+    let mut io = Script::setting_up("p", &[true, false, false, false, false]);
     setup(&mut io, &pyproject, &detected);
     assert!(io.text().contains("(5 detected)"));
     assert!(io.text().contains("(1 detected: gplpkg (GPL-3.0-only))"));
@@ -204,7 +310,7 @@ fn run_does_not_count_a_package_already_covered_by_an_earlier_allowance() {
         &["BSD-3-Clause", "GPL-3.0-or-later"],
         &["Permissive", "Copyleft"],
     );
-    let mut io = Script::confirming(&[true, true, false, false, false]);
+    let mut io = Script::setting_up("p", &[true, true, false, false, false]);
     setup(&mut io, &pyproject, &[scipy_like]);
     let copyleft_section = io
         .text()
@@ -224,7 +330,7 @@ fn run_returns_none_and_writes_nothing_when_declined_or_empty() {
         vec![true, true, false, false, false, false, false],
     ] {
         let (_tmp, pyproject) = project(BARE);
-        let mut io = Script::confirming(&confirms);
+        let mut io = Script::setting_up("p", &confirms);
         assert_eq!(setup(&mut io, &pyproject, &[]), None, "{confirms:?}");
         assert!(!fs::read_to_string(&pyproject)
             .expect("read")
@@ -237,7 +343,7 @@ fn run_forces_a_standalone_file_when_pyproject_is_missing() {
     let tmp = tempdir().expect("tempdir");
     let pyproject = tmp.path().join("pyproject.toml");
     // No "save to standalone?" question: setup + 4 categories + write.
-    let mut io = Script::confirming(&[true, true, false, false, false, true]);
+    let mut io = Script::setting_up("p", &[true, true, false, false, false, true]);
     let written = setup(&mut io, &pyproject, &[]).expect("written");
     assert_eq!(written, tmp.path().join("trustedlicenses.toml"));
     assert!(written.is_file());
@@ -251,7 +357,7 @@ fn run_forces_a_standalone_file_when_pyproject_is_missing() {
 fn run_writes_a_standalone_file_when_explicitly_chosen() {
     let (tmp, pyproject) = project(BARE);
     let original = fs::read_to_string(&pyproject).expect("read");
-    let mut io = Script::confirming(&[true, true, false, false, false, true, true]);
+    let mut io = Script::setting_up("p", &[true, true, false, false, false, true, true]);
     let written = setup(&mut io, &pyproject, &[]).expect("written");
     assert_eq!(written, tmp.path().join("trustedlicenses.toml"));
     assert_eq!(fs::read_to_string(&pyproject).expect("read"), original);
@@ -336,6 +442,7 @@ fn review(
         failures,
         compatibility_notes: Vec::new(),
         exceptions: Vec::new(),
+        pinned: false,
     };
     let env = HashMap::new();
     let services = Services {
@@ -399,6 +506,55 @@ fn review_allowing_a_category_writes_it_not_the_package() {
         set(&["Permissive", "Copyleft Limited"])
     );
     assert!(!policy.ignored_packages.contains("cons"));
+}
+
+const PINNED_FILE: &str =
+    "[project]\nname = \"x\"\n\n[tool.trustedlicenses]\nallowed-licenses = [\n    \"MIT\",\n]\n";
+
+#[test]
+fn reviewing_a_pinned_policy_adds_the_license_not_its_category() {
+    let (_tmp, pyproject) = project(PINNED_FILE);
+    let mut io = Script::choosing(&[true, true], &["a"]);
+    let cons = licence("cons", &["LGPL-3.0-or-later"], &["Copyleft Limited"]);
+    assert!(reviewed(&mut io, &pyproject, vec![cons]));
+    assert!(io
+        .text()
+        .contains("[a]dd LGPL-3.0-or-later to allowed-licenses"));
+    assert!(!io.text().contains("[a]llow"));
+    let policy = load_policy(&pyproject).expect("policy");
+    assert!(
+        policy.allowed_categories.is_empty(),
+        "the pin must survive a review"
+    );
+    assert_eq!(policy.allowed_licenses, set(&["LGPL-3.0-or-later", "MIT"]));
+}
+
+#[test]
+fn reviewing_a_with_license_offers_to_allow_that_exact_license() {
+    let (_tmp, pyproject) = project(POLICY_FILE);
+    let mut io = Script::choosing(&[true, true], &["a"]);
+    let llvm = licence("llvmpkg", &["GPL-3.0-only WITH LLVM-exception"], &[]);
+    assert!(reviewed(&mut io, &pyproject, vec![llvm]));
+    assert!(io
+        .text()
+        .contains("[a]dd GPL-3.0-only WITH LLVM-exception to allowed-licenses"));
+    assert!(!io.text().contains("[b]ulk-ignore"));
+    let policy = load_policy(&pyproject).expect("policy");
+    assert_eq!(policy.allowed_categories, set(&["Permissive"]));
+    assert_eq!(
+        policy.allowed_licenses,
+        set(&["GPL-3.0-only WITH LLVM-exception"])
+    );
+}
+
+#[test]
+fn a_pinned_policy_still_gets_the_blanket_correction_offer() {
+    let (_tmp, pyproject) = project(PINNED_FILE);
+    let policy = load_policy(&pyproject).expect("policy");
+    let mit = suggesting("pkg", "MIT License", "MIT");
+    assert!(would_pass_if_corrected(&mit, &policy));
+    let apache = suggesting("pkg", "Apache License", "Apache-2.0");
+    assert!(!would_pass_if_corrected(&apache, &policy));
 }
 
 #[test]
@@ -511,7 +667,7 @@ fn review_bulk_ignore_sweeps_only_the_remaining_undetectable_packages() {
     let failures = vec![
         failure("pkg-a"),
         failure("pkg-b"),
-        licence("pkg-c", &[], &["Copyleft"]),
+        licence("pkg-c", &["GPL-3.0-only"], &["Copyleft"]),
     ];
     assert!(reviewed(&mut io, &pyproject, failures));
     let policy = load_policy(&pyproject).expect("policy");
@@ -597,6 +753,7 @@ fn review_aborts_gracefully_when_a_prompt_is_never_answered() {
         checked: 1,
         compatibility_notes: Vec::new(),
         exceptions: Vec::new(),
+        pinned: false,
     };
     let index = FakeIndex::default();
     let env = HashMap::new();
@@ -629,8 +786,8 @@ fn webencodings() -> DistributionLicence {
 
 #[test]
 fn only_undetected_failures_are_offered_the_index_check() {
-    assert!(failure_options(&failure("webencodings")).contains("[c]heck"));
-    assert!(!failure_options(&licence("mitpkg", &["MIT"], &[])).contains("[c]heck"));
+    assert!(failure_options(&failure("webencodings"), false).contains("[c]heck"));
+    assert!(!failure_options(&licence("mitpkg", &["MIT"], &[]), false).contains("[c]heck"));
 }
 
 #[test]
