@@ -23,6 +23,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod args;
+mod audit;
 mod check;
 mod context;
 mod gather;
@@ -77,8 +78,14 @@ pub fn run(args: &[OsString], ctx: &mut Context) -> i32 {
         None => check::check_environment(ctx, &cli),
         Some(Command::Check { packages }) => check::check_new_packages(ctx, &cli, packages),
         Some(Command::IndexCheck { package }) => check::index_check(ctx, &cli, package),
-        Some(Command::Pin { dry_run }) => pin::pin(ctx, &cli, *dry_run),
+        Some(Command::Setup) => check::setup(ctx, &cli),
+        Some(Command::Pin { dry_run, category }) => pin::pin(ctx, &cli, *dry_run, category),
         Some(Command::Report { output }) => report::report(ctx, &cli, output.as_deref()),
+        Some(Command::Audit {
+            paths,
+            policy,
+            output,
+        }) => audit::audit(ctx, &cli, paths, policy.as_deref(), output.as_deref()),
     }
 }
 

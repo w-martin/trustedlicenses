@@ -43,6 +43,10 @@ keys are optional:
   error that names the right spelling, except custom `LicenseRef-` ids. A license with an
   exception, such as `GPL-2.0-only WITH Classpath-exception-2.0`, is its own license with no
   category, so it passes only when listed here or in `accepted-licenses`.
+- `pinned-categories` records the categories `pin` replaced with their licenses. It allows
+  nothing itself: a license new to the project in one of them fails, and the fix suggests
+  listing that license rather than allowing the category again. A category can't be in both
+  `allowed-categories` and `pinned-categories`.
 - `accepted-licenses` maps a package name to the SPDX ids accepted for that package alone:
 
   ```toml
@@ -60,6 +64,22 @@ keys are optional:
   couldn't be identified, a free-text `License` statement awaiting review, or a package whose
   license couldn't be read (a git or local-path dependency, a package missing from the
   index). Those keep failing with their reason.
+- `trusted-indexes` lists package indexes, such as an internal Nexus or Artifactory
+  repository, whose packages pass when they have no license or one that can't be identified:
+  your own code, published without a license. A package from one of them with a detected
+  license is still judged as usual, and one whose license couldn't be read still fails.
+  Because a declared but unidentifiable license passes too, trust only an index of your own
+  code, not a curated mirror of other people's. It needs a
+  [lock file](#auditing-a-lock-file), which records where each package comes from; an
+  installed environment doesn't. Write each URL as your lock file or pip/uv config has it,
+  without credentials (an entry with credentials, or PyPI's, is a config error):
+
+  ```toml
+  trusted-indexes = ["https://nexus.example.com/repository/pypi-internal/simple"]
+  ```
+
+  Trust a repository that serves only your packages, not a group repository that also
+  proxies PyPI: every unlicensed PyPI package fetched through it would pass too.
 - `ignored-packages` skips packages entirely, whatever they detect as, by canonical (PEP 503
   normalised) name: for a package you've verified by hand, e.g. a `LicenseRef-` custom license
   your legal team has reviewed. It trusts the package rather than a license, so prefer the
@@ -200,7 +220,7 @@ Choice (i/o/p): p
 
 Permissive: MIT, BSD, Apache-2.0, ISC, ... -- minimal restrictions: use, modify, and
 redistribute freely, usually with just an attribution/copyright notice.
-  (20 detected)
+  (19 detected)
 Allow Permissive licenses? [Y/n]: y
 
 Public Domain: CC0, Unlicense, ... -- copyright is waived entirely. No restrictions at all.
@@ -210,7 +230,7 @@ Allow Public Domain licenses? [Y/n]: y
 Copyleft Limited: LGPL, MPL-2.0, ... -- changes to the licensed code must be shared with
 anyone you distribute it to; the rest of your project can keep its own license. A few
 licenses here (RPL, APSL, EUPL, ...) also count internal or network use, so check any you see.
-  (none detected in your environment)
+  (1 detected: certifi (MPL-2.0))
 Allow Copyleft Limited licenses? [Y/n]: y
 
 Copyleft: GPL, AGPL, ... -- a much bigger commitment: distributing a work that includes
@@ -219,16 +239,19 @@ your own code needs a compatible one.
   For a product: shipping copies brings in GPL's full terms; hosting only doesn't,
   but AGPL does if you modify it. Answer n and accept individual packages in the
   review after the check.
-  (1 detected: gplpkg (GPL-2.0-only))
+  (none detected in your environment)
 Allow Copyleft licenses? [y/N]: n
 
 Allowed categories: Permissive, Public Domain, Copyleft Limited
 
-These categories allow 3 license(s) in your environment now: Apache-2.0, BSD-3-Clause, MIT.
-  Pinned, the policy lists exactly these, so a license new to the project
-  fails until you accept it: stricter, for publishing. Keeping categories is
-  easier while developing; `trustedlicenses pin` can pin later.
-Pin to these licenses instead of the categories? [y/N]: n
+Pinning a category lists the licenses it allows in your environment now, so a
+  license from it that's new to the project fails until you accept it. Worth it
+  where a category's licenses ask different things (Copyleft Limited: LGPL, MPL,
+  EUPL, ...); `trustedlicenses pin --category` can pin one later.
+  Permissive: Apache-2.0, BSD-3-Clause, MIT (19 package(s))
+Pin Permissive? [y/N]: n
+  Copyleft Limited: MPL-2.0 (1 package(s))
+Pin Copyleft Limited? [Y/n]: y
 
 Save to a separate trustedlicenses.toml instead of adding to pyproject.toml? [y/N]: n
 
@@ -247,8 +270,17 @@ categories are the same in every case ([Choosing a policy](choosing-a-policy.md)
 
 Packages in a category are named when there are one or two. Categories outside these four
 (e.g. `Proprietary Free`) are never assumed: the wizard lists
-what it saw and lets you type the exact names to allow, comma-separated. The pin question
-defaults to keeping the categories ([Pinning](#pinning-to-specific-licenses)).
+what it saw and lets you type the exact names to allow, comma-separated. It then offers to
+pin each allowed category that has a license in use ([Pinning one
+category](#pinning-one-category)). Copyleft Limited and Copyleft default to pinned, since
+their licenses ask the most different things; Permissive and Public Domain default to
+staying whole. Packages with no identifiable license from an index other than PyPI are
+grouped by index, with an offer to add it to `trusted-indexes`. That defaults to yes, unless
+the index also serves packages that do have a license, which suggests it proxies PyPI. The
+review after a check offers the same as `[o]ur index`. If any package with no license is
+left, it lists them and asks whether to set `allow-unlicensed`, defaulting to no: with no
+license stated you'd be relying on an implied permission, and it's often just missing
+metadata worth checking package by package.
 
 Without a real terminal (CI, pre-commit, piped input, or `--quiet`) it never prompts, since
 that would hang a pipeline. Instead it lists every installed package's detected license and
@@ -274,6 +306,23 @@ report-only mode for the environment check (exit `0`), or an error for `check <p
 A misconfiguration is different: a `[tool.trustedlicenses]` table (or `trustedlicenses.toml`)
 with neither `allowed-categories` nor `allowed-licenses` is a hard error (exit `1`) that shows
 the exact TOML to add, and never starts the wizard or report-only mode.
+
+### Re-running setup
+
+The guided setup offers itself only while there is no policy. `trustedlicenses setup` runs it
+on demand, with or without one. Over an existing policy, each answer defaults to what the
+policy says now, so pressing Enter throughout changes nothing:
+
+- a category already pinned keeps the licenses it's pinned to, while one newly pinned takes
+  those its packages use today;
+- `allowed-licenses` entries with no category of their own (a `LicenseRef-`, a `WITH`
+  expression) are kept, and any for a category you stop pinning are listed as they go;
+- before writing, it lists the decisions earlier reviews recorded package by package
+  (`accepted-licenses`, `ignored-packages`, `verified-packages`, `verified-statements`,
+  `trust-corrected-licenses`) and asks whether to keep them, defaulting to yes.
+
+It rewrites the policy where it lives, leaving the rest of the file as it was, then runs a
+check. Like the first setup, it needs a terminal and refuses under `--quiet`.
 
 ## Auditing a lock file
 
@@ -382,7 +431,7 @@ isolated environment most hooks use. Add `trustedlicenses` as a dev dependency, 
 
 ```yaml
 - repo: https://github.com/w-martin/trustedlicenses
-  rev: v0.5.0
+  rev: v0.6.0
   hooks:
     - id: trustedlicenses
 ```
@@ -409,10 +458,10 @@ installing your project's dependencies:
   run: pip install -r requirements.txt   # or uv sync, poetry install, ...
 
 - name: Check dependency licenses
-  uses: w-martin/trustedlicenses@v0.5.0
+  uses: w-martin/trustedlicenses@v0.6.0
 ```
 
-It takes two optional inputs: `version`, an exact release such as `0.5.0` (default latest),
+It takes two optional inputs: `version`, an exact release such as `0.6.0` (default latest),
 and `args`, default `--quiet --installed`; pass `--quiet` alone to audit a lock file instead.
 It installs with `uv pip install` when `uv` is on `PATH`, otherwise `pip install`.
 
@@ -449,6 +498,7 @@ A category allows every license in it, including ones your project has never use
 `trustedlicenses pin` replaces `allowed-categories` with `allowed-licenses`: the SPDX ids
 those categories let through in your project today. Every package keeps its current result,
 and a license new to the project fails until you accept it. Use it before publishing.
+It records the categories it replaced in `pinned-categories`.
 
 ```shell
 $ trustedlicenses pin --dry-run
@@ -468,6 +518,33 @@ only. [Licenses to check individually](choosing-a-policy.md#licenses-to-check-in
 are marked in the list. Once pinned, a failure suggests adding its license to
 `allowed-licenses`, and the review's `[a]` choice does that.
 
+### Pinning one category
+
+Not every category needs the same care. Most permissive licenses ask little beyond keeping a
+notice, while Copyleft Limited covers licenses as different as LGPL, MPL-2.0 and EUPL-1.2.
+`--category` pins only the category you name, and keeps allowing the others whole:
+
+```shell
+$ trustedlicenses pin --category "Copyleft Limited"
+"Copyleft Limited" becomes 1 license(s) in allowed-licenses; "Permissive" stays allowed whole:
+  MPL-2.0
+
+Pinned "Copyleft Limited" in pyproject.toml. A "Copyleft Limited" license new to the project now fails until you accept it.
+```
+
+```toml
+[tool.trustedlicenses]
+allowed-categories = ["Permissive"]
+allowed-licenses = [
+    "MPL-2.0",
+]
+pinned-categories = ["Copyleft Limited"]
+```
+
+A new permissive dependency still passes. A new LGPL one fails, and its fix suggests adding
+its license to `allowed-licenses`. Repeat `--category` to pin several. Pinning a category
+nothing uses today records it all the same, so any license from it fails until accepted.
+
 ## A report for review
 
 `trustedlicenses report` writes a Markdown summary of the policy for a legal, compliance or
@@ -484,6 +561,33 @@ beside it). *What we could accept but don't* lists packages that fail today and 
 allowed categories; any listed in `allowed-licenses` are flagged under *What we accept*
 instead. It doesn't describe what each license obliges you to do; it links the
 [legal disclaimer](https://github.com/w-martin/trustedlicenses#legal-disclaimer).
+
+## Auditing several codebases
+
+`trustedlicenses audit` writes one Markdown report covering several codebases, including
+ones that don't use trustedlicenses yet:
+
+```shell
+trustedlicenses audit ../api ../billing ../tools/requirements.txt --policy org-policy.toml
+```
+
+Each path is a project directory or a lock file. A directory is read from its `uv.lock`,
+`pylock.toml`, `poetry.lock`, `Pipfile.lock` or, failing those, a `requirements.txt` with
+every requirement pinned with `==`. Nothing is installed or run: license metadata comes from
+the package index, as when [auditing a lock file](#auditing-a-lock-file).
+
+Each codebase is judged by its own policy (`[tool.trustedlicenses]` or `trustedlicenses.toml`)
+if it has one, else by `--policy FILE`, else not judged and just listed. `--policy` takes a
+standalone `trustedlicenses.toml`-style file or a `pyproject.toml` with the table, so one
+policy can be applied to codebases that have none.
+
+The report opens with a summary row per codebase and a table of every license in use across
+them, with the codebases each one appears in and where it fails the policy. Then comes each
+codebase's own [report](#a-report-for-review). A codebase that can't be read, for example one
+without a lock file or with loose requirements, gets a row saying why, and the others are
+still audited. Like `report`, `audit` takes `--output FILE`, writes progress to standard
+error, and exits 0 once the report is written. It doesn't take `--lock`, `--installed`,
+`--venv` or `--python`, since each codebase is read from its path.
 
 ## Would upgrading help? (opt-in, uses the network)
 

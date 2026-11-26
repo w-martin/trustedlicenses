@@ -25,7 +25,7 @@ fn render(policy: Option<&Policy>, detected: &[DistributionLicence]) -> String {
         generated: "2026-11-22 by trustedlicenses 0.4.0",
         read_from: "`uv.lock`",
         from_lock: false,
-        policy_file: "pyproject.toml",
+        policy_from: "`pyproject.toml`",
         policy,
         detected,
         ignored_reasons: &reasons,
@@ -190,4 +190,147 @@ fn flags_outliers_listed_in_allowed_licenses_as_accepted() {
         "{report}"
     );
     assert_eq!(needs_individual_check("MIT"), None);
+}
+
+#[test]
+fn a_partly_pinned_policy_names_its_pinned_categories() {
+    let policy = Policy {
+        allowed_categories: set(&["Permissive"]),
+        allowed_licenses: set(&["MPL-2.0"]),
+        pinned_categories: set(&["Copyleft Limited"]),
+        ..Policy::default()
+    };
+    let report = render(Some(&policy), &detected());
+    assert!(
+        report.contains("These categories are **pinned**: `Copyleft Limited`."),
+        "{report}"
+    );
+    // A pinned category's outliers no longer pass unnoticed, so none is flagged.
+    assert!(!report.contains("| RPL-1.5 |"), "{report}");
+}
+
+#[test]
+fn without_a_policy_it_names_none() {
+    let report = render(None, &detected());
+    assert!(report.contains("- **Policy:** none configured"), "{report}");
+    assert!(!report.contains("Built for"), "{report}");
+}
+
+#[test]
+fn an_audit_summarises_each_codebase_and_the_licenses_between_them() {
+    let policy = Policy {
+        allowed_categories: set(&["Permissive"]),
+        ..Policy::default()
+    };
+    let reasons = BTreeMap::new();
+    let judged = [
+        licence("requests", &["Apache-2.0"]),
+        licence("certifi", &["MPL-2.0"]),
+    ];
+    let listed = [licence("certifi", &["MPL-2.0"]), licence("bare", &[])];
+    let input = |name: &'static str, policy: Option<&'static str>, detected| ReportInput {
+        project: Some(name),
+        generated: "",
+        read_from: "`uv.lock`",
+        from_lock: true,
+        policy_from: policy.unwrap_or(""),
+        policy: None,
+        detected,
+        ignored_reasons: &reasons,
+    };
+    let projects = [
+        AuditProject {
+            path: "api",
+            name: "api",
+            outcome: Ok(ReportInput {
+                policy: Some(&policy),
+                ..input("api", Some("`org.toml` (`--policy`)"), &judged)
+            }),
+        },
+        AuditProject {
+            path: "../tools",
+            name: "tools",
+            outcome: Ok(input("tools", None, &listed)),
+        },
+        AuditProject {
+            path: "gone",
+            name: "gone",
+            outcome: Err("doesn't exist".to_owned()),
+        },
+    ];
+    let audit = render_audit("today", Some("`org.toml` (`--policy`)"), &projects);
+    assert!(audit.starts_with("# License audit\n"), "{audit}");
+    assert!(audit.contains("- **Codebases:** 3"), "{audit}");
+    assert!(
+        audit.contains(
+            "| api | `api` | `uv.lock` | `org.toml` (`--policy`) | 2 | 1 of 2 pass; 1 doesn't |"
+        ),
+        "{audit}"
+    );
+    assert!(
+        audit.contains("| tools | `../tools` | `uv.lock` | none | 2 | not judged |"),
+        "{audit}"
+    );
+    assert!(
+        audit.contains("| gone | `gone` | — | — | — | couldn't be read: doesn't exist |"),
+        "{audit}"
+    );
+    assert!(
+        audit.contains("| MPL-2.0 | Copyleft Limited | api: 1; tools: 1 | api |"),
+        "{audit}"
+    );
+    assert!(
+        audit.contains("| (no license detected) | — | tools: 1 | — |"),
+        "{audit}"
+    );
+    // Each codebase's own report sits one heading level down.
+    assert!(audit.contains("\n## api\n"), "{audit}");
+    assert!(audit.contains("\n### What we accept\n"), "{audit}");
+    assert!(
+        audit.contains("\n### What we could accept but don't\n"),
+        "{audit}"
+    );
+    assert_eq!(audit.matches("not legal advice").count(), 1, "{audit}");
+}
+
+#[test]
+fn a_package_built_at_install_time_is_named_in_the_report() {
+    let mut dbt = licence("dbt", &[]);
+    dbt.in_tree_backend = Some("_dbt_sa_build".to_owned());
+    let report = render(None, &[licence("requests", &["Apache-2.0"]), dbt]);
+    assert!(
+        report.contains("- **Built at install time:** dbt (`_dbt_sa_build`)."),
+        "{report}"
+    );
+}
+
+#[test]
+fn an_audit_counts_unreadable_packages_apart_from_unlicensed_ones() {
+    let reasons = BTreeMap::new();
+    let mut broken = licence("private", &[]);
+    broken.unreadable = true;
+    let detected = [broken, licence("bare", &[])];
+    let projects = [AuditProject {
+        path: "api",
+        name: "api",
+        outcome: Ok(ReportInput {
+            project: Some("api"),
+            generated: "",
+            read_from: "`uv.lock`",
+            from_lock: true,
+            policy_from: "",
+            policy: None,
+            detected: &detected,
+            ignored_reasons: &reasons,
+        }),
+    }];
+    let audit = render_audit("today", None, &projects);
+    assert!(
+        audit.contains("| (license couldn't be read) | — | api: 1 | — |"),
+        "{audit}"
+    );
+    assert!(
+        audit.contains("| (no license detected) | — | api: 1 | — |"),
+        "{audit}"
+    );
 }

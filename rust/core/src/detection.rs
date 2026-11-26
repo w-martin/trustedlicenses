@@ -87,6 +87,12 @@ pub struct DistributionLicence {
     /// A license statement is declared or license files are shipped, whether or not they could be
     /// identified. Such a package has a license; it is just not one this tool recognises.
     pub declares_license: bool,
+    /// The package index it was read from, as [`crate::policy::index_key`] spells it. `None` for
+    /// an installed package, which doesn't record where it came from.
+    pub index: Option<String>,
+    /// The in-tree build backend of the source archive it was read from, if any: what installs
+    /// is whatever that backend produces, which may not be what was read.
+    pub in_tree_backend: Option<String>,
 }
 
 impl DistributionLicence {
@@ -452,6 +458,8 @@ pub fn inspect_distribution(dist: &Distribution, name: Option<&str>) -> Distribu
             version: dist.version.clone(),
             unreadable: false,
             declares_license: true,
+            index: None,
+            in_tree_backend: None,
         };
     }
 
@@ -481,6 +489,8 @@ pub fn inspect_distribution(dist: &Distribution, name: Option<&str>) -> Distribu
         version: dist.version.clone(),
         unreadable: false,
         declares_license: !statements.is_empty() || !files.is_empty(),
+        index: None,
+        in_tree_backend: None,
     }
 }
 

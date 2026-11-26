@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 /// Check dependency licenses against policy.
-#[derive(Debug, Parser)]
+#[derive(Clone, Debug, Parser)]
 #[command(name = "trustedlicenses", version)]
 pub struct Cli {
     /// Path to the pyproject.toml holding [tool.trustedlicenses].
@@ -77,7 +77,7 @@ pub struct Cli {
     pub command: Option<Command>,
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Clone, Debug, Subcommand)]
 pub enum Command {
     /// Check whether package(s) could be added without a license problem, before adding them.
     Check {
@@ -85,6 +85,11 @@ pub enum Command {
         #[arg(required = true)]
         packages: Vec<String>,
     },
+    /// Run the guided setup, even when a policy already exists: each answer then defaults to
+    /// what the policy says now, and the package-by-package decisions from reviews can be kept.
+    ///
+    /// Needs a terminal; it never runs under --quiet.
+    Setup,
     /// Ask the package index whether a newer release of a package ships a license.
     ///
     /// Opt-in: sends only the package name to the index your project's lockfile/config
@@ -101,12 +106,37 @@ pub enum Command {
         /// Show what would be written, without writing it.
         #[arg(long)]
         dry_run: bool,
+
+        /// Pin only this category, e.g. "Copyleft Limited", and keep allowing the others whole.
+        /// Repeat to pin several. Without it, every allowed category is pinned.
+        #[arg(long, value_name = "NAME")]
+        category: Vec<String>,
     },
     /// Write a Markdown report of the policy for whoever reviews it: what's accepted and
     /// why, and what could be accepted but isn't.
     ///
     /// Always exits 0 when the report is written: it describes the policy, it doesn't gate.
     Report {
+        /// Write the report to this file instead of standard output.
+        #[arg(long, short, value_name = "FILE")]
+        output: Option<PathBuf>,
+    },
+    /// Write one Markdown report covering several codebases, whether or not they use
+    /// trustedlicenses yet: the licenses each one uses, and how each fares against a policy.
+    ///
+    /// Each codebase is judged by its own policy, else by --policy, else just listed. Always
+    /// exits 0 when the report is written: it describes, it doesn't gate.
+    Audit {
+        /// Codebases to audit: a project directory holding uv.lock, pylock.toml, poetry.lock,
+        /// Pipfile.lock or a pinned requirements.txt, or one of those files.
+        #[arg(required = true, value_name = "PATH")]
+        paths: Vec<PathBuf>,
+
+        /// Policy for codebases that have none of their own: a trustedlicenses.toml, or a
+        /// pyproject.toml with a [tool.trustedlicenses] table.
+        #[arg(long, value_name = "FILE")]
+        policy: Option<PathBuf>,
+
         /// Write the report to this file instead of standard output.
         #[arg(long, short, value_name = "FILE")]
         output: Option<PathBuf>,

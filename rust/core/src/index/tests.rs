@@ -1650,3 +1650,75 @@ fn a_private_ca_index_is_trusted_only_with_its_ca_bundle() {
     let page = client.get(&url, None, None).expect("trusted CA");
     assert_eq!(String::from_utf8_lossy(&page.body), TLS_INDEX_PAGE);
 }
+
+#[test]
+fn an_sdist_that_builds_with_its_own_backend_is_flagged_and_stays_flagged_from_the_cache() {
+    let info = "Metadata-Version: 2.1\nName: pkg\nVersion: 1.0\n";
+    let pyproject =
+        "[build-system]\nrequires = []\nbuild-backend = \"_fetch_build\"\nbackend-path = [\".\"]\n";
+    let site = site_with_sdist(
+        "pkg-1.0.tar.gz",
+        sdist_tar_gz(&[
+            ("pkg-1.0/pyproject.toml", pyproject),
+            ("pkg-1.0/PKG-INFO", info),
+        ]),
+    );
+    let cache = tempdir().expect("tempdir");
+    let dist = fetch(&site, cache.path(), "1.0").expect("fetch");
+    assert_eq!(in_tree_backend(&dist).as_deref(), Some("_fetch_build"));
+    let before = site.requests().len();
+    let cached = fetch(&site, cache.path(), "1.0").expect("cached");
+    assert_eq!(site.requests().len(), before);
+    assert_eq!(in_tree_backend(&cached).as_deref(), Some("_fetch_build"));
+    assert!(inspect_distribution(&cached, Some("pkg")).keys.is_empty());
+}
+
+#[test]
+fn an_sdist_with_an_ordinary_backend_is_not_flagged() {
+    let info = "Metadata-Version: 2.4\nName: pkg\nVersion: 1.0\nLicense-Expression: MIT\n";
+    let pyproject =
+        "[build-system]\nrequires = [\"hatchling\"]\nbuild-backend = \"hatchling.build\"\n";
+    let site = site_with_sdist(
+        "pkg-1.0.tar.gz",
+        sdist_tar_gz(&[
+            ("pkg-1.0/PKG-INFO", info),
+            ("pkg-1.0/pyproject.toml", pyproject),
+        ]),
+    );
+    let cache = tempdir().expect("tempdir");
+    let dist = fetch(&site, cache.path(), "1.0").expect("fetch");
+    assert_eq!(in_tree_backend(&dist), None);
+}
+
+#[test]
+fn a_cache_entry_an_older_layout_wrote_is_never_read() {
+    let site = site();
+    let cache = tempdir().expect("tempdir");
+    site.add_wheel("1.0", Some(MIT), false);
+    // Where an older version kept this release: no format segment in the path, and here it
+    // says GPL.
+    let current = cache_entry(&options(cache.path()), &site.url(""), "pkg", "1.0");
+    let relative = current
+        .strip_prefix(cache.path().join(format!("v{CACHE_FORMAT}")))
+        .expect("versioned");
+    let old = cache.path().join(relative);
+    let old_info = old.join("pkg-1.0.dist-info");
+    fs::create_dir_all(&old_info).expect("mkdir");
+    fs::write(
+        old_info.join("METADATA"),
+        "Metadata-Version: 2.4\nName: pkg\nVersion: 1.0\nLicense-Expression: GPL-3.0-only\n",
+    )
+    .expect("write");
+    fs::write(old.join(".complete"), b"").expect("write");
+
+    let dist = fetch(&site, cache.path(), "1.0").expect("fetch");
+    assert_eq!(
+        inspect_distribution(&dist, Some("pkg")).keys,
+        BTreeSet::from(["MIT".to_owned()])
+    );
+    // Left where it was, for an older version still using it.
+    assert!(old_info.join("METADATA").is_file());
+    let before = site.requests().len();
+    fetch(&site, cache.path(), "1.0").expect("cached");
+    assert_eq!(site.requests().len(), before);
+}

@@ -126,6 +126,12 @@ downloading the whole wheel, up to 25 MB. A release with no wheel has its source
 `PKG-INFO` names, plus those at the top of the project or in a top-level `licenses` directory,
 never vendored code deeper in the tree.
 
+A source distribution whose `pyproject.toml` sets `backend-path` builds with code of its own
+at install time, and that code can download or generate what actually installs. `dbt` 2.x is
+one: its source distribution is a stub whose backend fetches a prebuilt wheel from elsewhere.
+What was read may then not be what installs, so the run says which packages these are and
+marks their source line; check what they install.
+
 `index-check` works with any index that speaks the standard simple API. If it offers
 per-release metadata (PEP 658, as PyPI does), that's all it reads; otherwise it downloads the
 wheel, up to 25 MB. The line under `Index:` in its output shows which your index supports. A

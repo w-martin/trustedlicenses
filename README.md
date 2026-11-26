@@ -6,7 +6,7 @@
 [![Documentation](https://readthedocs.org/projects/trustedlicenses/badge/?version=latest)](https://trustedlicenses.readthedocs.io/en/latest/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-> ⚠️ **Experimental (v0.5.0).** The API and config format aren't stable yet, and license
+> ⚠️ **Experimental (v0.6.0).** The API and config format aren't stable yet, and license
 > detection can be wrong. Read the [legal disclaimer](#legal-disclaimer) before relying on it
 > for a real compliance decision.
 
@@ -63,11 +63,16 @@ covers internal tooling, open-source packages and products.
 ## Commands
 
 - `trustedlicenses` checks the project against your policy.
+- `trustedlicenses setup` runs the guided setup again over an existing policy, each answer
+  defaulting to what the policy says now.
 - `trustedlicenses check <package> ...` checks packages, and their transitive dependencies,
   before you add them.
-- `trustedlicenses pin [--dry-run]` swaps your categories for the specific licenses in use.
+- `trustedlicenses pin [--category NAME] [--dry-run]` swaps your categories, or just one,
+  for the specific licenses in use.
 - `trustedlicenses report [--output FILE]` writes a Markdown summary for legal or compliance
   review.
+- `trustedlicenses audit PATH... [--policy FILE]` reports on several codebases at once,
+  including ones that don't use trustedlicenses yet.
 - `trustedlicenses index-check <package>` asks your package index whether a newer release
   declares a license.
 

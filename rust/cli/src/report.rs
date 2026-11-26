@@ -59,7 +59,7 @@ pub fn report(ctx: &mut Context, cli: &Cli, output: Option<&Path>) -> i32 {
         generated: &generated,
         read_from: &read_from,
         from_lock,
-        policy_file: &policy_source(pyproject).display().to_string(),
+        policy_from: &format!("`{}`", policy_source(pyproject).display()),
         policy: policy.as_ref(),
         detected: &detected,
         ignored_reasons: &reasons,

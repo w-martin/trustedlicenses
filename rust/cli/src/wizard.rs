@@ -15,15 +15,18 @@
 
 use crate::context::{Color, Style};
 use crate::prompt::{timeout_notice, PromptError, Prompter};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use trustedlicenses_core::config::{
-    add_to_policy, write_new_policy, CorrectionTrust, NewPolicy, PolicyAdditions, UseCase,
+    add_to_policy, policy_source, rewrite_policy, write_new_policy, CorrectionTrust, NewPolicy,
+    PolicyAdditions, UseCase,
 };
 use trustedlicenses_core::detection::{categories_for, DistributionLicence};
 use trustedlicenses_core::index::{audit_package, format_audit, AuditOptions, Client};
 use trustedlicenses_core::index_discovery::{discover_index, redact_url, DiscoveryContext};
-use trustedlicenses_core::policy::{format_failure, pin_licenses, Policy, PolicyResult};
+use trustedlicenses_core::policy::{
+    format_failure, is_public_index, pinnable_licenses, trusted_by_index, Policy, PolicyResult,
+};
 
 /// What a wizard needs from the outside world beyond the terminal.
 pub struct Services<'a> {
@@ -44,6 +47,22 @@ pub trait Wizard {
         pyproject: &Path,
         detected: &[DistributionLicence],
     ) -> Result<Option<PathBuf>, PromptError>;
+
+    /// Run guided setup because it was asked for, over `prior` when a policy exists: each
+    /// answer defaults to what it says now. Returns the file written, or `None`.
+    ///
+    /// # Errors
+    ///
+    /// [`PromptError::Aborted`] when input ends mid-flow.
+    fn setup(
+        &mut self,
+        _io: &mut dyn Prompter,
+        _pyproject: &Path,
+        _detected: &[DistributionLicence],
+        _prior: Option<&Policy>,
+    ) -> Result<Option<PathBuf>, PromptError> {
+        Ok(None)
+    }
 
     /// Offer to review failures and record decisions in `policy_path`. Returns whether the
     /// policy file changed.
@@ -159,19 +178,282 @@ fn abbreviated(licenses: &BTreeSet<String>) -> String {
     }
 }
 
+/// Categories whose licenses differ most in what they ask; pinning them is suggested.
+const PIN_BY_DEFAULT: [&str; 2] = ["Copyleft Limited", "Copyleft"];
+
+/// Ask, category by category, which to pin to the licenses they allow today. A category the
+/// prior policy already pins keeps the licenses it's pinned to, so re-running changes nothing
+/// unless asked; one newly pinned takes those its packages use today. A category with no
+/// license in use and not pinned before isn't offered: pinning it would just disallow it.
+fn ask_pins(
+    io: &mut dyn Prompter,
+    detected: &[DistributionLicence],
+    allowed: &[String],
+    prior: Option<&Policy>,
+) -> Result<(Vec<String>, BTreeSet<String>), PromptError> {
+    // The prior policy's corrections and ignored packages decide what passes today, so they
+    // decide what pinning would list.
+    let policy = Policy {
+        allowed_categories: allowed.iter().cloned().collect(),
+        ..prior.cloned().unwrap_or_default()
+    };
+    let offers: Vec<(&String, BTreeSet<String>, bool)> = allowed
+        .iter()
+        .map(|category| {
+            let pinned_before =
+                prior.is_some_and(|prior| prior.pinned_categories.contains(category));
+            let licenses = if pinned_before {
+                prior
+                    .map(|prior| {
+                        prior
+                            .allowed_licenses
+                            .iter()
+                            .filter(|id| categories_for([id.as_str()]).contains(category))
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            } else {
+                pinnable_licenses(detected, &policy, &BTreeSet::from([category.clone()]))
+            };
+            (category, licenses, pinned_before)
+        })
+        .filter(|(_, licenses, pinned_before)| *pinned_before || !licenses.is_empty())
+        .collect();
+    let mut pinned_categories = Vec::new();
+    let mut pinned_licenses = BTreeSet::new();
+    if offers.is_empty() {
+        return Ok((pinned_categories, pinned_licenses));
+    }
+    io.echo("\nPinning a category lists the licenses it allows in your environment now, so a");
+    io.echo("  license from it that's new to the project fails until you accept it. Worth it");
+    io.echo("  where a category's licenses ask different things (Copyleft Limited: LGPL, MPL,");
+    io.echo("  EUPL, ...); `trustedlicenses pin --category` can pin one later.");
+    for (category, licenses, pinned_before) in offers {
+        if pinned_before {
+            let to = if licenses.is_empty() {
+                "no license".to_owned()
+            } else {
+                abbreviated(&licenses)
+            };
+            io.echo(&format!("  {category}: pinned now, to {to}"));
+        } else {
+            let packages = detected
+                .iter()
+                .filter(|result| result.categories.contains(category.as_str()))
+                .count();
+            io.echo(&format!(
+                "  {category}: {} ({packages} package(s))",
+                abbreviated(&licenses)
+            ));
+        }
+        let default = prior.map_or_else(
+            || PIN_BY_DEFAULT.contains(&category.as_str()),
+            |_| pinned_before,
+        );
+        if io.confirm(&format!("Pin {category}?"), default)? {
+            pinned_categories.push(category.clone());
+            pinned_licenses.extend(licenses);
+        }
+    }
+    Ok((pinned_categories, pinned_licenses))
+}
+
+/// Offer to trust each non-PyPI index serving packages with no identifiable license, then ask
+/// about any package with no license that's left. Returns `(trusted indexes, allow-unlicensed)`.
+fn ask_unlicensed(
+    io: &mut dyn Prompter,
+    detected: &[DistributionLicence],
+    prior: Option<&Policy>,
+) -> Result<(Vec<String>, bool), PromptError> {
+    let mut by_index: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
+    for result in detected
+        .iter()
+        .filter(|result| result.keys.is_empty() && !result.unreadable)
+    {
+        if let Some(index) = result.index.as_deref().filter(|i| !is_public_index(i)) {
+            by_index
+                .entry(index)
+                .or_default()
+                .insert(result.name.clone());
+        }
+    }
+    let mut trusted: Vec<String> = Vec::new();
+    for (index, names) in &by_index {
+        io.echo(&format!(
+            "\nNo identifiable license, from {index}: {}.",
+            abbreviated(names)
+        ));
+        let licensed = detected
+            .iter()
+            .filter(|result| result.index.as_deref() == Some(*index) && !result.keys.is_empty())
+            .count();
+        if licensed > 0 {
+            io.echo(&format!(
+                "  It also serves {licensed} package(s) that do have a license, so it may proxy PyPI:"
+            ));
+            io.echo("  trusting it would pass any unlicensed package that comes through it.");
+        } else {
+            io.echo(
+                "  If this is your own internal index, its packages are your code: trusting it",
+            );
+            io.echo("  passes those with no license, and still judges any that have one.");
+        }
+        let default = prior.map_or(licensed == 0, |prior| {
+            prior.trusted_indexes.contains(*index)
+        });
+        if io.confirm(
+            &format!("Trust packages with no license from {index}?"),
+            default,
+        )? {
+            trusted.push((*index).to_owned());
+        }
+    }
+    // An index trusted before but serving nothing this run isn't asked about, so it stays.
+    if let Some(prior) = prior {
+        for index in &prior.trusted_indexes {
+            if !by_index.contains_key(index.as_str()) {
+                trusted.push(index.clone());
+            }
+        }
+    }
+    let trusted_set: BTreeSet<String> = trusted.iter().cloned().collect();
+    let unlicensed: BTreeSet<String> = detected
+        .iter()
+        .filter(|result| result.is_unlicensed() && !trusted_by_index(result, &trusted_set))
+        .map(|result| result.name.clone())
+        .collect();
+    let current = prior.is_some_and(|prior| prior.allow_unlicensed);
+    if unlicensed.is_empty() {
+        return Ok((trusted, current));
+    }
+    io.echo(&format!(
+        "\nNo license at all: {}.",
+        abbreviated(&unlicensed)
+    ));
+    io.echo("  Copyright applies without a notice, so with no license stated you'd be relying");
+    io.echo("  on an implied permission from publishing it: arguable for installing and using,");
+    io.echo("  weaker for redistributing. Often it's just missing metadata, so check each one;");
+    io.echo("  answering n lets you accept them one at a time in the review after the check.");
+    let allow = io.confirm("Allow packages with no license?", current)?;
+    Ok((trusted, allow))
+}
+
+/// The prior policy as setup sees it: a category whose licenses are listed in
+/// `allowed-licenses` but which isn't allowed whole counts as pinned, whether `pin` recorded it
+/// in `pinned-categories` (older versions didn't) or the list was written by hand. Without
+/// this, re-running setup over such a policy would offer to drop those licenses.
+fn as_seen_by_setup(prior: &Policy) -> Policy {
+    let mut seen = prior.clone();
+    for license in &prior.allowed_licenses {
+        for category in categories_for([license.as_str()]) {
+            if !prior.allowed_categories.contains(&category) {
+                seen.pinned_categories.insert(category);
+            }
+        }
+    }
+    seen
+}
+
+/// What a write came to, said to the user.
+fn report_written(
+    io: &mut dyn Prompter,
+    written: Result<PathBuf, trustedlicenses_core::config::ConfigError>,
+) -> Option<PathBuf> {
+    match written {
+        Ok(written) => {
+            io.secho(
+                &format!("\nWrote policy to {}.", written.display()),
+                Style::bold(Color::Green),
+            );
+            Some(written)
+        }
+        Err(error) => {
+            io.secho(
+                &format!("\ntrustedlicenses: {error}"),
+                Style::bold(Color::Red),
+            );
+            None
+        }
+    }
+}
+
+/// List the decisions earlier reviews recorded package by package, and ask whether to keep
+/// them. Not asked when there are none.
+fn ask_keep_package_entries(io: &mut dyn Prompter, prior: &Policy) -> Result<bool, PromptError> {
+    let names = |items: Vec<String>| -> String {
+        abbreviated(&items.into_iter().collect::<BTreeSet<String>>())
+    };
+    let mut lines = Vec::new();
+    if !prior.accepted_licenses.is_empty() {
+        lines.push(format!(
+            "accepted-licenses: {}",
+            names(prior.accepted_licenses.keys().cloned().collect())
+        ));
+    }
+    if !prior.ignored_packages.is_empty() {
+        lines.push(format!(
+            "ignored-packages: {}",
+            names(prior.ignored_packages.iter().cloned().collect())
+        ));
+    }
+    if !prior.verified_packages.is_empty() {
+        lines.push(format!(
+            "verified-packages: {}",
+            names(prior.verified_packages.keys().cloned().collect())
+        ));
+    }
+    if !prior.verified_statements.is_empty() {
+        lines.push(format!(
+            "verified-statements: {} statement(s)",
+            prior.verified_statements.len()
+        ));
+    }
+    if prior.trust_corrected_licenses {
+        lines.push("trust-corrected-licenses = true".to_owned());
+    }
+    if lines.is_empty() {
+        return Ok(true);
+    }
+    io.echo("\nThe policy also has decisions recorded package by package:");
+    for line in &lines {
+        io.echo(&format!("  {line}"));
+    }
+    io.echo("  Dropping them makes those packages fail again until reviewed.");
+    io.confirm("Keep these?", true)
+}
+
 /// No default: the answer changes what is suggested, so it has to be the user's.
-fn ask_use_case(io: &mut dyn Prompter) -> Result<UseCase, PromptError> {
+/// `optional`: a re-run over a policy that never recorded one may leave it unrecorded.
+fn ask_use_case(
+    io: &mut dyn Prompter,
+    current: Option<UseCase>,
+    optional: bool,
+) -> Result<Option<UseCase>, PromptError> {
     io.echo("What are you building?");
     io.echo("  [i] internal tooling or pipelines -- nothing leaves your organisation");
     io.echo("  [o] an open-source package or tool others install (e.g. from PyPI)");
     io.echo("  [p] a product you ship to customers or host for them");
     io.echo("  Not sure, or it may ship later? Choose p.");
+    let default = current.map_or("", |case| &case.as_str()[..1]);
+    let skippable = optional && current.is_none();
+    if skippable {
+        io.echo("  Your policy doesn't record one: press Enter to leave it that way.");
+    }
     loop {
-        let answer = io.prompt("Choice (i/o/p)", "")?;
+        let answer = io.prompt("Choice (i/o/p)", default)?;
+        if skippable && answer.trim().is_empty() {
+            return Ok(None);
+        }
+        let answer = if answer.trim().is_empty() {
+            default.to_owned()
+        } else {
+            answer
+        };
         match answer.trim().to_lowercase().chars().next() {
-            Some('i') => return Ok(UseCase::Internal),
-            Some('o') => return Ok(UseCase::OpenSource),
-            Some('p') => return Ok(UseCase::Product),
+            Some('i') => return Ok(Some(UseCase::Internal)),
+            Some('o') => return Ok(Some(UseCase::OpenSource)),
+            Some('p') => return Ok(Some(UseCase::Product)),
             _ => io.echo("  Type i, o or p (not sure? p)."),
         }
     }
@@ -193,6 +475,7 @@ const BULK_IGNORE: &str = "b";
 const VERIFY_PACKAGE: &str = "v";
 const TRUST_TEXT: &str = "t";
 const CHECK_INDEX: &str = "c";
+const TRUST_INDEX: &str = "o";
 const SKIP: &str = "s";
 const QUIT: &str = "q";
 
@@ -248,6 +531,7 @@ struct ReviewDecisions {
     verified_packages: Vec<(String, (String, String))>,
     verified_statements: Vec<(String, String)>,
     trust_corrected_licenses: bool,
+    trusted_indexes: BTreeSet<String>,
 }
 
 fn set_ordered<V>(entries: &mut Vec<(String, V)>, key: String, value: V) {
@@ -266,7 +550,8 @@ impl ReviewDecisions {
             && self.allowed_licenses.is_empty()
             && self.verified_packages.is_empty()
             && self.verified_statements.is_empty()
-            && !self.trust_corrected_licenses)
+            && !self.trust_corrected_licenses
+            && self.trusted_indexes.is_empty())
     }
 }
 
@@ -361,6 +646,12 @@ fn failure_options(failure: &DistributionLicence, pinned: bool) -> String {
             "[{TRUST_TEXT}]rust \"{statement}\" -> {spdx_id} for any package"
         ));
     }
+    if let Some(index) = own_index(failure) {
+        options.push(format!(
+            "[{TRUST_INDEX}]ur index: pass every package with no identified license from {index} \
+             (trusted-indexes)"
+        ));
+    }
     if failure.keys.is_empty() {
         options.push(format!(
             "[{CHECK_INDEX}]heck the package index for a version that ships a license"
@@ -369,6 +660,18 @@ fn failure_options(failure: &DistributionLicence, pinned: bool) -> String {
     options.push(format!("[{SKIP}]kip"));
     options.push(format!("[{QUIT}]uit reviewing"));
     format!("  {}", options.join("; "))
+}
+
+/// The non-PyPI index a failure with no identifiable license came from, if any: the one a
+/// `trusted-indexes` entry would cover.
+fn own_index(failure: &DistributionLicence) -> Option<&str> {
+    if !failure.keys.is_empty() || failure.unreadable {
+        return None;
+    }
+    failure
+        .index
+        .as_deref()
+        .filter(|index| !is_public_index(index))
 }
 
 /// Apply one prompted choice, returning `(quit_requested, bulk_ignore_requested)`.
@@ -400,6 +703,8 @@ fn apply_choice(
         );
     } else if choice == ALLOW_UNLICENSED && failure.is_unlicensed() {
         decisions.allow_unlicensed = true;
+    } else if let (TRUST_INDEX, Some(index)) = (choice, own_index(failure)) {
+        decisions.trusted_indexes.insert(index.to_owned());
     } else if choice == IGNORE {
         set_ordered(
             &mut decisions.ignored,
@@ -472,6 +777,11 @@ fn summarize_and_write(
     if decisions.allow_unlicensed {
         io.echo("  allow packages that have no license (allow-unlicensed = true)");
     }
+    for index in &decisions.trusted_indexes {
+        io.echo(&format!(
+            "  pass packages with no identified license from {index} (trusted-indexes)"
+        ));
+    }
     let mut accepted = decisions.accepted.clone();
     accepted.sort();
     for (name, licenses) in accepted {
@@ -520,6 +830,7 @@ fn summarize_and_write(
             })
             .collect(),
         allow_unlicensed: decisions.allow_unlicensed,
+        trusted_indexes: decisions.trusted_indexes.iter().cloned().collect(),
         reasons: decisions.ignored.iter().cloned().collect(),
         trust: Some(CorrectionTrust {
             enabled: decisions.trust_corrected_licenses.then_some(true),
@@ -671,11 +982,16 @@ pub struct InteractiveWizard {
 }
 
 impl InteractiveWizard {
+    #[allow(clippy::too_many_lines)]
     fn run_flow(
         io: &mut dyn Prompter,
         pyproject: &Path,
         detected: &[DistributionLicence],
+        prior: Option<&Policy>,
+        explicit: bool,
     ) -> Result<Option<PathBuf>, PromptError> {
+        let seen = prior.map(as_seen_by_setup);
+        let prior = seen.as_ref();
         let with_license = detected
             .iter()
             .filter(|result| !result.keys.is_empty())
@@ -685,21 +1001,36 @@ impl InteractiveWizard {
             detected.len()
         ));
 
-        if !io.confirm(
-            "No policy configured yet -- would you like to run the guided setup?",
-            true,
-        )? {
+        if !explicit
+            && !io.confirm(
+                "No policy configured yet -- would you like to run the guided setup?",
+                true,
+            )?
+        {
             return Ok(None);
         }
+        if prior.is_some() {
+            io.echo(&format!(
+                "Each answer defaults to what {} says now: press Enter to keep it.",
+                policy_source(pyproject).display()
+            ));
+        }
         io.echo("");
-        let use_case = ask_use_case(io)?;
+        let use_case = ask_use_case(io, prior.and_then(|prior| prior.use_case), prior.is_some())?;
         io.echo("");
+        let hint_case = use_case.unwrap_or(UseCase::Product);
 
+        let allowed_before = |category: &str| {
+            prior.map(|prior| {
+                prior.allowed_categories.contains(category)
+                    || prior.pinned_categories.contains(category)
+            })
+        };
         let mut allowed: Vec<String> = Vec::new();
         for (category, explanation, default) in PRIMARY_CATEGORIES {
             io.echo(&format!("{category}: {explanation}"));
             if category == COPYLEFT {
-                for line in copyleft_hint(use_case) {
+                for line in copyleft_hint(hint_case) {
                     io.echo(&format!("  {line}"));
                 }
             }
@@ -708,6 +1039,7 @@ impl InteractiveWizard {
                 "  {}",
                 category_summary(detected, category, &already)
             ));
+            let default = allowed_before(category).unwrap_or(default);
             if io.confirm(&format!("Allow {category} licenses?"), default)? {
                 allowed.push(category.to_owned());
             }
@@ -721,23 +1053,36 @@ impl InteractiveWizard {
             .iter()
             .map(|(name, _, _)| *name)
             .collect();
-        let other_categories: BTreeSet<&String> = detected
+        let previously: BTreeSet<String> = prior
+            .map(|prior| {
+                prior
+                    .allowed_categories
+                    .union(&prior.pinned_categories)
+                    .filter(|category| !primary.contains(category.as_str()))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut other_categories: BTreeSet<String> = detected
             .iter()
             .filter(|result| result.categories.is_disjoint(&already))
             .flat_map(|result| result.categories.iter())
             .filter(|category| !primary.contains(category.as_str()))
+            .cloned()
             .collect();
+        other_categories.extend(previously.iter().cloned());
         if !other_categories.is_empty() {
             let listed = other_categories
                 .iter()
-                .map(|c| c.as_str())
+                .map(String::as_str)
                 .collect::<Vec<_>>()
                 .join(", ");
-            io.echo(&format!("Also detected in your environment: {listed}."));
-            if other_categories
-                .iter()
-                .any(|c| c.as_str() == SOURCE_AVAILABLE)
-            {
+            if previously.is_empty() {
+                io.echo(&format!("Also detected in your environment: {listed}."));
+            } else {
+                io.echo(&format!("Also detected or allowed before: {listed}."));
+            }
+            if other_categories.contains(SOURCE_AVAILABLE) {
                 io.echo(
                     "Source-available licenses vary: some (BUSL, CC-BY-NC) restrict use even \
                      internally, others (SSPL, Elastic) restrict offering the software to others as \
@@ -745,10 +1090,20 @@ impl InteractiveWizard {
                      review after the check.",
                 );
             }
-            let extra = io.prompt(
-                "Allow any of these too? Comma-separated exact names, or Enter to skip",
-                "",
-            )?;
+            let default = previously.iter().cloned().collect::<Vec<_>>().join(", ");
+            let question = if default.is_empty() {
+                "Allow any of these too? Comma-separated exact names, or Enter to skip".to_owned()
+            } else {
+                format!(
+                    "Allow any of these too? Comma-separated exact names, or Enter for [{default}]"
+                )
+            };
+            let extra = io.prompt(&question, &default)?;
+            let extra = if extra.trim().is_empty() {
+                default
+            } else {
+                extra
+            };
             allowed.extend(
                 extra
                     .split(',')
@@ -766,70 +1121,91 @@ impl InteractiveWizard {
             &format!("\nAllowed categories: {}", allowed.join(", ")),
             Style::bold(Color::Green),
         );
-        let pinnable = pin_licenses(
-            detected,
-            &Policy {
-                allowed_categories: allowed.iter().cloned().collect(),
-                ..Policy::default()
-            },
-        );
-        let pin = !pinnable.is_empty() && {
-            io.echo(&format!(
-                "\nThese categories allow {} license(s) in your environment now: {}.",
-                pinnable.len(),
-                abbreviated(&pinnable)
-            ));
-            io.echo("  Pinned, the policy lists exactly these, so a license new to the project");
-            io.echo("  fails until you accept it: stricter, for publishing. Keeping categories is");
-            io.echo("  easier while developing; `trustedlicenses pin` can pin later.");
-            io.confirm("Pin to these licenses instead of the categories?", false)?
-        };
+        let (pinned_categories, mut pinned_licenses) = ask_pins(io, detected, &allowed, prior)?;
+        let (trusted_indexes, allow_unlicensed) = ask_unlicensed(io, detected, prior)?;
 
-        let standalone = if pyproject.is_file() {
-            io.confirm(
-                &format!(
-                    "\nSave to a separate trustedlicenses.toml instead of adding to {}?",
+        let Some(prior) = prior else {
+            let standalone = if pyproject.is_file() {
+                io.confirm(
+                    &format!(
+                        "\nSave to a separate trustedlicenses.toml instead of adding to {}?",
+                        pyproject.display()
+                    ),
+                    false,
+                )?
+            } else {
+                io.echo(&format!(
+                    "\n{} doesn't exist -- writing a separate trustedlicenses.toml.",
                     pyproject.display()
-                ),
-                false,
-            )?
-        } else {
-            io.echo(&format!(
-                "\n{} doesn't exist -- writing a separate trustedlicenses.toml.",
-                pyproject.display()
-            ));
-            true
+                ));
+                true
+            };
+            if !io.confirm("\nWrite this configuration?", true)? {
+                return Ok(None);
+            }
+            let written = write_new_policy(
+                pyproject,
+                &NewPolicy {
+                    allowed_categories: &allowed,
+                    pinned_categories: &pinned_categories,
+                    pinned_licenses: &pinned_licenses,
+                    allow_unlicensed,
+                    trusted_indexes: &trusted_indexes,
+                    ignored_packages: &[],
+                    use_case,
+                },
+                standalone,
+            );
+            return Ok(report_written(io, written));
         };
 
-        if !io.confirm("\nWrite this configuration?", true)? {
+        // allowed-licenses: a license goes only when a category it was pinned under is
+        // unpinned now; everything else listed stays as it was.
+        let unpinned: BTreeSet<&String> = prior
+            .pinned_categories
+            .iter()
+            .filter(|category| !pinned_categories.contains(category))
+            .collect();
+        let mut dropped = BTreeSet::new();
+        for license in &prior.allowed_licenses {
+            let released = categories_for([license.as_str()])
+                .iter()
+                .any(|category| unpinned.contains(category));
+            if released && !pinned_licenses.contains(license) {
+                dropped.insert(license.clone());
+            } else {
+                pinned_licenses.insert(license.clone());
+            }
+        }
+        if !dropped.is_empty() {
+            io.echo(&format!(
+                "\nNo longer listed in allowed-licenses, as your answers above decide them: {}.",
+                abbreviated(&dropped)
+            ));
+        }
+        let keep = ask_keep_package_entries(io, prior)?;
+        let source = policy_source(pyproject);
+        if !io.confirm(
+            &format!("\nRewrite the policy in {}?", source.display()),
+            true,
+        )? {
             return Ok(None);
         }
-        let written = write_new_policy(
-            pyproject,
+        let written = rewrite_policy(
+            &source,
             &NewPolicy {
                 allowed_categories: &allowed,
-                pinned_licenses: pin.then_some(&pinnable),
+                pinned_categories: &pinned_categories,
+                pinned_licenses: &pinned_licenses,
+                allow_unlicensed,
+                trusted_indexes: &trusted_indexes,
                 ignored_packages: &[],
-                use_case: Some(use_case),
+                use_case,
             },
-            standalone,
-        );
-        match written {
-            Ok(written) => {
-                io.secho(
-                    &format!("\nWrote policy to {}.", written.display()),
-                    Style::bold(Color::Green),
-                );
-                Ok(Some(written))
-            }
-            Err(error) => {
-                io.secho(
-                    &format!("\ntrustedlicenses: {error}"),
-                    Style::bold(Color::Red),
-                );
-                Ok(None)
-            }
-        }
+            keep,
+        )
+        .map(|()| source);
+        Ok(report_written(io, written))
     }
 
     fn review_flow(
@@ -858,9 +1234,10 @@ impl InteractiveWizard {
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
 
-        let pinned = policy.allowed_categories.is_empty();
         let mut bulk_ignore_undetectable = false;
         for failure in &remaining {
+            let pinned = policy.allowed_categories.is_empty()
+                || !failure.categories.is_disjoint(&policy.pinned_categories);
             if bulk_ignore_undetectable && failure.keys.is_empty() {
                 set_ordered(
                     &mut decisions.ignored,
@@ -870,6 +1247,9 @@ impl InteractiveWizard {
                 continue;
             }
             if decisions.allow_unlicensed && failure.is_unlicensed() {
+                continue;
+            }
+            if trusted_by_index(failure, &decisions.trusted_indexes) {
                 continue;
             }
             let choice = ask_choice(io, services, failure, project_dir, pinned)?;
@@ -890,13 +1270,29 @@ impl Wizard for InteractiveWizard {
         pyproject: &Path,
         detected: &[DistributionLicence],
     ) -> Result<Option<PathBuf>, PromptError> {
-        match Self::run_flow(io, pyproject, detected) {
+        match Self::run_flow(io, pyproject, detected, None, false) {
             Err(PromptError::Timeout) => {
                 timeout_notice(
                     io,
                     "aborting setup",
                     "(Running non-interactively? Pass --quiet to skip this wizard entirely.)",
                 );
+                Ok(None)
+            }
+            other => other,
+        }
+    }
+
+    fn setup(
+        &mut self,
+        io: &mut dyn Prompter,
+        pyproject: &Path,
+        detected: &[DistributionLicence],
+        prior: Option<&Policy>,
+    ) -> Result<Option<PathBuf>, PromptError> {
+        match Self::run_flow(io, pyproject, detected, prior, true) {
+            Err(PromptError::Timeout) => {
+                timeout_notice(io, "aborting setup", "Nothing has been written.");
                 Ok(None)
             }
             other => other,

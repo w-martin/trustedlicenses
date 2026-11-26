@@ -29,6 +29,27 @@ pub struct Sdist {
     pub pkg_info: String,
     /// The license files, as paths relative to the project root, with their contents.
     pub licences: Vec<(PathBuf, Vec<u8>)>,
+    /// The build backend, when `pyproject.toml` ships it inside the archive (`backend-path`):
+    /// code of the package's own that runs at install time and may fetch what gets installed,
+    /// so what was read here may not be what installs.
+    pub in_tree_backend: Option<String>,
+}
+
+/// The in-tree build backend a `pyproject.toml` declares, if any.
+fn in_tree_backend(pyproject: &str) -> Option<String> {
+    let table: toml::Table = pyproject.parse().ok()?;
+    let build = table.get("build-system")?.as_table()?;
+    let paths = build.get("backend-path")?.as_array()?;
+    if paths.is_empty() {
+        return None;
+    }
+    Some(
+        build
+            .get("build-backend")
+            .and_then(toml::Value::as_str)
+            .unwrap_or("an in-tree backend")
+            .to_owned(),
+    )
 }
 
 /// Whether the file at `relative` (under the project root) is one to read.
@@ -112,8 +133,10 @@ fn tar_entries(body: &[u8]) -> tar::Archive<impl Read + '_> {
 fn read_tar_gz(body: &[u8]) -> Result<Sdist, String> {
     let invalid = |error: std::io::Error| format!("not a valid sdist archive: {error}");
 
-    // First pass: the project root and PKG-INFO, which says which license files to take.
+    // First pass: the project root and PKG-INFO, which says which license files to take, and
+    // pyproject.toml, which says how the package builds.
     let mut found: Option<(String, String)> = None;
+    let mut pyprojects: Vec<(String, String)> = Vec::new();
     for entry in tar_entries(body).entries().map_err(invalid)? {
         let mut entry = entry.map_err(invalid)?;
         if !entry.header().entry_type().is_file() {
@@ -121,14 +144,20 @@ fn read_tar_gz(body: &[u8]) -> Result<Sdist, String> {
         }
         let path = entry.path().map_err(invalid)?.into_owned();
         if let Some((top, relative)) = below_top(&path) {
-            if relative == Path::new("PKG-INFO") {
+            if relative == Path::new("PKG-INFO") && found.is_none() {
                 let text = String::from_utf8_lossy(&read_capped(&mut entry)?).into_owned();
                 found = Some((top, text));
-                break;
+            } else if relative == Path::new("pyproject.toml") {
+                let text = String::from_utf8_lossy(&read_capped(&mut entry)?).into_owned();
+                pyprojects.push((top, text));
             }
         }
     }
     let (top, pkg_info) = found.ok_or("the sdist has no PKG-INFO")?;
+    let in_tree_backend = pyprojects
+        .iter()
+        .find(|(entry_top, _)| *entry_top == top)
+        .and_then(|(_, text)| in_tree_backend(text));
     let declared: Vec<String> = parse_metadata(&pkg_info)
         .get_all("License-File")
         .map(str::to_owned)
@@ -149,7 +178,11 @@ fn read_tar_gz(body: &[u8]) -> Result<Sdist, String> {
             add_licence(&mut licences, relative, read_capped(&mut entry)?)?;
         }
     }
-    Ok(Sdist { pkg_info, licences })
+    Ok(Sdist {
+        pkg_info,
+        licences,
+        in_tree_backend,
+    })
 }
 
 fn read_zip(body: &[u8]) -> Result<Sdist, String> {
@@ -180,6 +213,21 @@ fn read_zip(body: &[u8]) -> Result<Sdist, String> {
         .get_all("License-File")
         .map(str::to_owned)
         .collect();
+    let pyproject = names
+        .iter()
+        .find(|(_, entry_top, relative)| {
+            *entry_top == top && relative == Path::new("pyproject.toml")
+        })
+        .map(|(index, _, _)| *index);
+    let in_tree_backend = match pyproject {
+        None => None,
+        Some(index) => {
+            let mut entry = archive
+                .by_index(index)
+                .map_err(|error| format!("unreadable pyproject.toml: {error}"))?;
+            in_tree_backend(&String::from_utf8_lossy(&read_capped(&mut entry)?))
+        }
+    };
     let mut licences = Vec::new();
     for (index, entry_top, relative) in names {
         if entry_top == top && wanted(&relative, &declared) {
@@ -189,7 +237,11 @@ fn read_zip(body: &[u8]) -> Result<Sdist, String> {
             add_licence(&mut licences, relative, read_capped(&mut entry)?)?;
         }
     }
-    Ok(Sdist { pkg_info, licences })
+    Ok(Sdist {
+        pkg_info,
+        licences,
+        in_tree_backend,
+    })
 }
 
 /// Where a license file is stored: its own path, except that a name detection wouldn't recognise

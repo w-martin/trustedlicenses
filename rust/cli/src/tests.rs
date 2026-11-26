@@ -1554,3 +1554,270 @@ fn pin_marks_licenses_that_need_a_closer_look() {
         r.out
     );
 }
+
+#[test]
+fn pin_category_pins_only_that_category() {
+    let h = Harness::new();
+    let pyproject = h.pyproject(
+        "[project]\nname = 'x'\n\n[tool.trustedlicenses]\nallowed-categories = [\"Permissive\", \"Copyleft Limited\"]\n",
+    );
+    let venv = h.venv(&[("a", Some("MIT"), None), ("b", Some("MPL-2.0"), None)]);
+    let r = h.run(&[
+        "--pyproject",
+        &s(&pyproject),
+        "--venv",
+        &s(&venv),
+        "pin",
+        "--category",
+        "Copyleft Limited",
+    ]);
+    assert_eq!(r.code, 0, "{}{}", r.out, r.err);
+    assert!(
+        r.out.contains(
+            "\"Copyleft Limited\" becomes 1 license(s) in allowed-licenses; \"Permissive\" stays allowed whole:"
+        ),
+        "{}",
+        r.out
+    );
+    assert!(r.out.contains("  MPL-2.0\n"), "{}", r.out);
+    assert!(!r.out.contains("MIT"), "{}", r.out);
+    let written = fs::read_to_string(&pyproject).expect("read");
+    assert!(
+        written.contains(
+            "allowed-categories = [\"Permissive\"]\nallowed-licenses = [\n    \"MPL-2.0\",\n]\npinned-categories = [\"Copyleft Limited\"]\n"
+        ),
+        "{written}"
+    );
+
+    let again = Harness::new();
+    let pyproject = again.pyproject(&written);
+    let r = again.run(&[
+        "--pyproject",
+        &s(&pyproject),
+        "pin",
+        "--category",
+        "Copyleft Limited",
+    ]);
+    assert_eq!(r.code, 0, "{}{}", r.out, r.err);
+    assert!(r.out.contains("is already pinned"), "{}", r.out);
+}
+
+#[test]
+fn a_new_license_in_a_pinned_category_is_fixed_by_listing_the_license() {
+    let h = Harness::new();
+    let pyproject = h.pyproject(
+        "[tool.trustedlicenses]\nallowed-categories = [\"Permissive\"]\nallowed-licenses = [\"MPL-2.0\"]\npinned-categories = [\"Copyleft Limited\"]\n",
+    );
+    let venv = h.venv(&[("a", Some("MIT"), None), ("c", Some("EPL-2.0"), None)]);
+    let r = h.run(&["--pyproject", &s(&pyproject), "--venv", &s(&venv)]);
+    assert_eq!(r.code, 1, "{}", r.out);
+    assert!(
+        r.out.contains("or add \"EPL-2.0\" to allowed-licenses"),
+        "{}",
+        r.out
+    );
+    assert!(!r.out.contains("to allowed-categories"), "{}", r.out);
+}
+
+#[test]
+fn pin_category_refuses_a_category_the_policy_doesnt_allow() {
+    let h = Harness::new();
+    let pyproject = h.pyproject(PERMISSIVE_POLICY);
+    let r = h.run(&[
+        "--pyproject",
+        &s(&pyproject),
+        "pin",
+        "--category",
+        "Copyleft",
+    ]);
+    assert_eq!(r.code, 1);
+    assert!(
+        r.err
+            .contains("\"Copyleft\" isn't in allowed-categories, so there's nothing to pin"),
+        "{}",
+        r.err
+    );
+    assert_eq!(
+        fs::read_to_string(&pyproject).expect("read"),
+        PERMISSIVE_POLICY
+    );
+}
+
+#[test]
+fn audit_covers_several_codebases_with_and_without_a_policy() {
+    let h = Harness::new();
+    let covered = h.path("covered");
+    let uncovered = h.path("uncovered");
+    let unlocked = h.path("unlocked");
+    for dir in [&covered, &uncovered, &unlocked] {
+        fs::create_dir_all(dir).expect("mkdir");
+    }
+    fs::write(
+        covered.join("pyproject.toml"),
+        "[project]\nname = 'api'\n\n[tool.trustedlicenses]\nallowed-categories = [\"Permissive\", \"Copyleft Limited\"]\n",
+    )
+    .expect("write");
+    fs::write(
+        covered.join("uv.lock"),
+        uv_lock(&[("alpha", "1.0"), ("mpl", "1.0")]),
+    )
+    .expect("write");
+    fs::write(uncovered.join("requirements.txt"), "mpl==1.0\nbare==1.0\n").expect("write");
+    let shared = h.path("org.toml");
+    fs::write(&shared, "allowed-categories = [\"Permissive\"]\n").expect("write");
+    h.index.publish("alpha", "1.0", "MIT");
+    h.index.publish("mpl", "1.0", "MPL-2.0");
+    h.index.publish("bare", "1.0", "MIT");
+    let r = h.run(&[
+        "audit",
+        &s(&covered),
+        &s(&uncovered),
+        &s(&unlocked),
+        "--policy",
+        &s(&shared),
+    ]);
+    assert_eq!(r.code, 0, "{}{}", r.out, r.err);
+    assert!(r.out.starts_with("# License audit\n"), "{}", r.out);
+    assert!(
+        r.out.contains("| api | ")
+            && r.out
+                .contains("| its own (`pyproject.toml`) | 2 | all 2 pass |"),
+        "{}",
+        r.out
+    );
+    assert!(
+        r.out.contains("| uncovered | ")
+            && r.out.contains("| `requirements.txt` | ")
+            && r.out
+                .contains("(`--policy`) | 2 | 1 of 2 pass; 1 doesn't |"),
+        "{}",
+        r.out
+    );
+    assert!(
+        r.out.contains("| unlocked | ") && r.out.contains("couldn't be read: no uv.lock"),
+        "{}",
+        r.out
+    );
+    assert!(
+        r.out
+            .contains("| MPL-2.0 | Copyleft Limited | api: 1; uncovered: 1 | uncovered |"),
+        "{}",
+        r.out
+    );
+    assert!(r.err.contains("Auditing"), "{}", r.err);
+}
+
+#[test]
+fn audit_takes_its_codebases_as_paths_not_lock_flags() {
+    let h = Harness::new();
+    let r = h.run(&["--lock", "uv.lock", "audit", "."]);
+    assert_eq!(r.code, 1);
+    assert!(r.err.contains("doesn't take --lock"), "{}", r.err);
+    let r = Harness::new().run(&["audit"]);
+    assert_eq!(r.code, 2);
+}
+
+#[test]
+fn packages_with_no_license_from_a_trusted_index_pass_and_are_listed() {
+    let nexus = "https://nexus.example.com/repository/pypi-internal/simple";
+    let lock = format!(
+        "{}[[package]]\nname = \"acmecore\"\nversion = \"1.0\"\nsource = {{ registry = \"{nexus}\" }}\n\n",
+        uv_lock(&[("alpha", "1.0")])
+    );
+    // The internal package is read from its installed copy, so the stub index needn't serve it.
+    let run = |policy: &str| {
+        let h = Harness::new();
+        let pyproject = h.pyproject(policy);
+        fs::write(h.path("uv.lock"), &lock).expect("write");
+        let venv = h.venv(&[("acmecore", None, None)]);
+        h.index.publish("alpha", "1.0", "MIT");
+        h.run(&[
+            "--pyproject",
+            &s(&pyproject),
+            "--prefer-installed",
+            "--venv",
+            &s(&venv),
+        ])
+    };
+    let r = run(PERMISSIVE);
+    assert_eq!(r.code, 1, "{}", r.out);
+    assert!(
+        r.out
+            .contains(&format!("add \"{nexus}\" to trusted-indexes")),
+        "{}",
+        r.out
+    );
+    let r = run(&format!("{PERMISSIVE}trusted-indexes = [\"{nexus}/\"]\n"));
+    assert_eq!(r.code, 0, "{}", r.out);
+    assert!(
+        r.out.contains(&format!(
+            "acmecore: no identified license, from {nexus} (trusted-indexes)"
+        )),
+        "{}",
+        r.out
+    );
+}
+
+#[test]
+fn setup_needs_a_terminal() {
+    let h = Harness::new();
+    let pyproject = h.pyproject(PERMISSIVE);
+    let r = h.run(&["--pyproject", &s(&pyproject), "setup"]);
+    assert_eq!(r.code, 1);
+    assert!(
+        format!("{}{}", r.out, r.err).contains("setup asks questions, so it needs a terminal"),
+        "{}{}",
+        r.out,
+        r.err
+    );
+    assert_eq!(fs::read_to_string(&pyproject).expect("read"), PERMISSIVE);
+}
+
+#[test]
+fn audit_finds_the_policy_above_a_lock_file_in_a_subdirectory_and_skips_repeats() {
+    let h = Harness::new();
+    let project = h.path("b");
+    fs::create_dir_all(project.join("sub")).expect("mkdir");
+    fs::write(
+        project.join("pyproject.toml"),
+        "[project]\nname = 'b'\n\n[tool.trustedlicenses]\nallowed-categories = [\"Public Domain\"]\n",
+    )
+    .expect("write");
+    let lock = project.join("sub").join("requirements.txt");
+    fs::write(&lock, "six==1.0\n").expect("write");
+    let shared = h.path("org.toml");
+    fs::write(&shared, "allowed-categories = [\"Permissive\"]\n").expect("write");
+    h.index.publish("six", "1.0", "MIT");
+    let r = h.run(&["audit", &s(&lock), &s(&lock), "--policy", &s(&shared)]);
+    assert_eq!(r.code, 0, "{}{}", r.out, r.err);
+    // b's own policy, which allows only Public Domain, judges it, not --policy.
+    assert!(
+        r.out.contains("| 1 | 0 of 1 pass; 1 doesn't |"),
+        "{}",
+        r.out
+    );
+    assert!(r.out.contains("pyproject.toml`) |"), "{}", r.out);
+    assert_eq!(r.out.matches("\n## b\n").count(), 1, "{}", r.out);
+    assert!(r.err.contains("it's already in this audit"), "{}", r.err);
+}
+
+#[test]
+fn pin_rejects_an_unknown_category_even_on_a_pinned_policy() {
+    let h = Harness::new();
+    let body = "[tool.trustedlicenses]\nallowed-licenses = [\"MIT\"]\n";
+    let pyproject = h.pyproject(body);
+    let r = h.run(&[
+        "--pyproject",
+        &s(&pyproject),
+        "pin",
+        "--category",
+        "Permisive",
+    ]);
+    assert_eq!(r.code, 1, "{}{}", r.out, r.err);
+    assert!(
+        r.err.contains("\"Permisive\" isn't a license category"),
+        "{}",
+        r.err
+    );
+    assert_eq!(fs::read_to_string(&pyproject).expect("read"), body);
+}

@@ -3,7 +3,9 @@
 
 use crate::config::UseCase;
 use crate::detection::{categories_for, DistributionLicence};
-use crate::policy::{effective_result, is_allowed, reevaluate, Policy, PolicyException};
+use crate::policy::{
+    effective_result, is_allowed, reevaluate, Policy, PolicyException, PolicyResult,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 
@@ -81,8 +83,9 @@ pub struct ReportInput<'a> {
     pub read_from: &'a str,
     /// Audited from a lock file rather than an installed environment.
     pub from_lock: bool,
-    /// Where the policy lives, e.g. `pyproject.toml`.
-    pub policy_file: &'a str,
+    /// Where the policy comes from, as Markdown, e.g. `` `pyproject.toml` ``; unused without
+    /// a policy.
+    pub policy_from: &'a str,
     pub policy: Option<&'a Policy>,
     pub detected: &'a [DistributionLicence],
     /// `ignored-packages` entry -> the reason recorded beside it.
@@ -169,23 +172,44 @@ fn why_failing(failure: &DistributionLicence) -> &'static str {
     }
 }
 
-fn header(out: &mut String, input: &ReportInput<'_>) {
-    let _ = writeln!(
-        out,
-        "# License policy report{}\n",
-        input
-            .project
-            .map(|name| format!(": {name}"))
-            .unwrap_or_default()
-    );
-    let _ = writeln!(out, "- **Generated:** {}", input.generated);
+/// `#` repeated for a heading `depth` levels down.
+fn heading(depth: usize) -> String {
+    "#".repeat(depth)
+}
+
+/// What was audited and under which policy, as bullets.
+fn details(out: &mut String, input: &ReportInput<'_>) {
     let _ = writeln!(out, "- **Packages read from:** {}", input.read_from);
-    let _ = writeln!(out, "- **Policy:** `{}`", input.policy_file);
-    let use_case = input.policy.and_then(|policy| policy.use_case);
+    let built: Vec<String> = input
+        .detected
+        .iter()
+        .filter_map(|result| {
+            result
+                .in_tree_backend
+                .as_ref()
+                .map(|backend| format!("{} (`{backend}`)", result.name))
+        })
+        .collect();
+    if !built.is_empty() {
+        let _ = writeln!(
+            out,
+            "- **Built at install time:** {}. Each was read from a source archive whose own \
+             build backend may download or generate what actually installs, so its license \
+             here may not be the installed one; check what it installs.",
+            built.join(", ")
+        );
+    }
+    let Some(policy) = input.policy else {
+        let _ = writeln!(out, "- **Policy:** none configured");
+        return;
+    };
+    let _ = writeln!(out, "- **Policy:** {}", input.policy_from);
     let _ = writeln!(
         out,
         "- **Built for:** {}",
-        use_case.map_or("not recorded (`use-case` isn't set)", use_case_label)
+        policy
+            .use_case
+            .map_or("not recorded (`use-case` isn't set)", use_case_label)
     );
 }
 
@@ -218,36 +242,31 @@ fn unconfigured(out: &mut String, detected: &[DistributionLicence]) {
 #[must_use]
 pub fn render_report(input: &ReportInput<'_>) -> String {
     let mut out = String::new();
-    header(&mut out, input);
-    let Some(policy) = input.policy else {
-        unconfigured(&mut out, input.detected);
-        footer(&mut out);
-        return out;
-    };
-    let result = reevaluate(input.detected, policy);
-    let passing = result.checked - result.failures.len();
-    let failing = match result.failures.len() {
-        0 => String::new(),
-        1 => "; 1 doesn't".to_owned(),
-        n => format!("; {n} don't"),
-    };
-    let installed: BTreeSet<&String> = input.detected.iter().map(|d| &d.name).collect();
-    let ignored = policy
-        .ignored_packages
-        .iter()
-        .filter(|name| installed.contains(name))
-        .count();
-    let ignored = match ignored {
-        0 => String::new(),
-        n => format!(" ({n} more in `ignored-packages` aren't checked)"),
-    };
     let _ = writeln!(
         out,
-        "- **Result:** {passing} of {} checked packages pass{failing}{ignored}",
-        result.checked
+        "# License policy report{}\n",
+        input
+            .project
+            .map(|name| format!(": {name}"))
+            .unwrap_or_default()
     );
+    let _ = writeln!(out, "- **Generated:** {}", input.generated);
+    render_project(&mut out, input, 2);
+    footer(&mut out);
+    out
+}
 
-    let _ = writeln!(out, "\n## What we accept\n");
+/// One project's details and findings, with its sections as headings `depth` levels down.
+fn render_project(out: &mut String, input: &ReportInput<'_>, depth: usize) {
+    details(out, input);
+    let Some(policy) = input.policy else {
+        unconfigured(out, input.detected);
+        return;
+    };
+    let result = reevaluate(input.detected, policy);
+    let _ = writeln!(out, "- **Result:** {}", result_line(input, policy, &result));
+
+    let _ = writeln!(out, "\n{} What we accept\n", heading(depth));
     if policy.allowed_categories.is_empty() {
         let _ = writeln!(
             out,
@@ -255,6 +274,13 @@ pub fn render_report(input: &ReportInput<'_>) -> String {
              license new to the project fails until someone accepts it.\n\n{}\n",
             code_list(&policy.allowed_licenses)
         );
+        if !policy.pinned_categories.is_empty() {
+            let _ = writeln!(
+                out,
+                "Pinned from these categories: {}.\n",
+                code_list(&policy.pinned_categories)
+            );
+        }
     } else {
         let _ = writeln!(
             out,
@@ -268,12 +294,20 @@ pub fn render_report(input: &ReportInput<'_>) -> String {
                 code_list(&policy.allowed_licenses)
             );
         }
+        if !policy.pinned_categories.is_empty() {
+            let _ = writeln!(
+                out,
+                "These categories are **pinned**: {}. Only their licenses listed above are \
+                 allowed, so a new one fails until someone accepts it.",
+                code_list(&policy.pinned_categories)
+            );
+        }
         let _ = writeln!(out);
     }
     let in_use = licenses_in_use(input.detected, policy);
     if !in_use.is_empty() {
         let _ = writeln!(out, "Licenses in use under the policy:\n");
-        license_table(&mut out, &in_use);
+        license_table(out, &in_use);
     }
     let listed: Vec<(&String, &str)> = policy
         .allowed_licenses
@@ -293,17 +327,41 @@ pub fn render_report(input: &ReportInput<'_>) -> String {
         }
     }
 
+    let installed: BTreeSet<&String> = input.detected.iter().map(|d| &d.name).collect();
     exceptions(
-        &mut out,
+        out,
         policy,
         &result.exceptions,
         input.ignored_reasons,
         &installed,
         input.from_lock,
+        depth + 1,
     );
-    not_accepted(&mut out, policy, &result.failures, &in_use);
-    footer(&mut out);
-    out
+    not_accepted(out, policy, &result.failures, &in_use, depth);
+}
+
+/// e.g. `4 of 6 checked packages pass; 2 don't (1 more in `ignored-packages` aren't checked)`.
+fn result_line(input: &ReportInput<'_>, policy: &Policy, result: &PolicyResult) -> String {
+    let passing = result.checked - result.failures.len();
+    let failing = match result.failures.len() {
+        0 => String::new(),
+        1 => "; 1 doesn't".to_owned(),
+        n => format!("; {n} don't"),
+    };
+    let installed: BTreeSet<&String> = input.detected.iter().map(|d| &d.name).collect();
+    let ignored = policy
+        .ignored_packages
+        .iter()
+        .filter(|name| installed.contains(name))
+        .count();
+    let ignored = match ignored {
+        0 => String::new(),
+        n => format!(" ({n} more in `ignored-packages` aren't checked)"),
+    };
+    format!(
+        "{passing} of {} checked packages pass{failing}{ignored}",
+        result.checked
+    )
 }
 
 fn exceptions(
@@ -313,13 +371,15 @@ fn exceptions(
     reasons: &BTreeMap<String, String>,
     installed: &BTreeSet<&String>,
     from_lock: bool,
+    depth: usize,
 ) {
     if excepted.is_empty() && policy.ignored_packages.is_empty() {
         return;
     }
     let _ = writeln!(
         out,
-        "\n### Exceptions\n\nThese packages pass only because the policy names them.\n"
+        "\n{} Exceptions\n\nThese packages pass only because the policy names them.\n",
+        heading(depth)
     );
     let _ = writeln!(out, "| Package | Accepted as | Recorded reason |");
     let _ = writeln!(out, "|---|---|---|");
@@ -334,6 +394,12 @@ fn exceptions(
             }
             PolicyException::Unlicensed { package } => {
                 let _ = writeln!(out, "| {package} | no license (`allow-unlicensed`) | — |");
+            }
+            PolicyException::TrustedIndex { package, index } => {
+                let _ = writeln!(
+                    out,
+                    "| {package} | no identified license, from `{index}` (`trusted-indexes`) | — |"
+                );
             }
         }
     }
@@ -358,6 +424,7 @@ fn not_accepted(
     policy: &Policy,
     failures: &[DistributionLicence],
     in_use: &BTreeMap<String, BTreeSet<String>>,
+    depth: usize,
 ) {
     let review: Vec<(&str, &str, String)> = CHECK_INDIVIDUALLY
         .iter()
@@ -371,7 +438,7 @@ fn not_accepted(
     if failures.is_empty() && review.is_empty() {
         return;
     }
-    let _ = writeln!(out, "\n## What we could accept but don't\n");
+    let _ = writeln!(out, "\n{} What we could accept but don't\n", heading(depth));
     if !failures.is_empty() {
         let _ = writeln!(
             out,
@@ -404,8 +471,8 @@ fn not_accepted(
         let _ = writeln!(
             out,
             "The allowed categories would also let in these licenses, which ask more than \
-             their category suggests. Pinning the policy (`trustedlicenses pin`) stops a new \
-             one passing unnoticed. See [Choosing a policy]({CHOOSING_URL}#licenses-to-check-individually).\n"
+             their category suggests. Pinning the category (`trustedlicenses pin --category \
+             <name>`) stops a new one passing unnoticed. See [Choosing a policy]({CHOOSING_URL}#licenses-to-check-individually).\n"
         );
         let _ = writeln!(out, "| License | Category | Why to look closer | In use |");
         let _ = writeln!(out, "|---|---|---|---|");
@@ -417,6 +484,175 @@ fn not_accepted(
             );
         }
     }
+}
+
+/// One codebase in an audit: what it says about itself, or why it couldn't be read.
+pub struct AuditProject<'a> {
+    /// The path it was given as, e.g. `../billing`.
+    pub path: &'a str,
+    pub name: &'a str,
+    pub outcome: Result<ReportInput<'a>, String>,
+}
+
+/// Render an audit of several codebases as Markdown: a summary row each, which licenses
+/// they use between them, then each one's report.
+#[must_use]
+pub fn render_audit(
+    generated: &str,
+    fallback_policy: Option<&str>,
+    projects: &[AuditProject<'_>],
+) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "# License audit\n");
+    let _ = writeln!(out, "- **Generated:** {generated}");
+    let _ = writeln!(out, "- **Codebases:** {}", projects.len());
+    if let Some(fallback) = fallback_policy {
+        let _ = writeln!(
+            out,
+            "- **Policy for codebases without their own:** {fallback}"
+        );
+    }
+
+    let _ = writeln!(out, "\n## Summary\n");
+    let _ = writeln!(
+        out,
+        "| Codebase | Path | Packages read from | Policy | Packages | Result |"
+    );
+    let _ = writeln!(out, "|---|---|---|---|---|---|");
+    for project in projects {
+        let label = format!("{} | `{}`", project.name, project.path);
+        match &project.outcome {
+            Err(error) => {
+                let _ = writeln!(
+                    out,
+                    "| {label} | — | — | — | couldn't be read: {} |",
+                    table_cell(error)
+                );
+            }
+            Ok(input) => {
+                let (policy, result) = match input.policy {
+                    None => ("none".to_owned(), "not judged".to_owned()),
+                    Some(policy) => {
+                        let result = reevaluate(input.detected, policy);
+                        let line = if result.passed() {
+                            format!("all {} pass", result.checked)
+                        } else {
+                            result_line(input, policy, &result)
+                                .replace(" checked packages pass", " pass")
+                        };
+                        (input.policy_from.to_owned(), line)
+                    }
+                };
+                let _ = writeln!(
+                    out,
+                    "| {label} | {} | {policy} | {} | {result} |",
+                    input.read_from,
+                    input.detected.len()
+                );
+            }
+        }
+    }
+
+    across_projects(&mut out, projects);
+
+    for project in projects {
+        let _ = writeln!(out, "\n## {}\n", project.name);
+        match &project.outcome {
+            Err(error) => {
+                let _ = writeln!(out, "- **Path:** `{}`", project.path);
+                let _ = writeln!(out, "\nCouldn't be read: {error}");
+            }
+            Ok(input) => {
+                let _ = writeln!(out, "- **Path:** `{}`", project.path);
+                render_project(&mut out, input, 3);
+            }
+        }
+    }
+    footer(&mut out);
+    out
+}
+
+/// Which licenses the codebases use between them, and where one fails its codebase's policy.
+fn across_projects(out: &mut String, projects: &[AuditProject<'_>]) {
+    let mut used: BTreeMap<String, BTreeMap<&str, usize>> = BTreeMap::new();
+    let mut failing: BTreeMap<String, BTreeSet<&str>> = BTreeMap::new();
+    const NONE: &str = "(no license detected)";
+    const UNREAD: &str = "(license couldn't be read)";
+    for project in projects {
+        let Ok(input) = &project.outcome else {
+            continue;
+        };
+        for result in input.detected {
+            let keys: Vec<String> = if result.unreadable {
+                vec![UNREAD.to_owned()]
+            } else if result.keys.is_empty() {
+                vec![NONE.to_owned()]
+            } else {
+                result.keys.iter().cloned().collect()
+            };
+            for key in keys {
+                *used
+                    .entry(key)
+                    .or_default()
+                    .entry(project.name)
+                    .or_default() += 1;
+            }
+        }
+        if let Some(policy) = input.policy {
+            for failure in reevaluate(input.detected, policy).failures {
+                let label = if failure.unreadable { UNREAD } else { NONE };
+                if failure.keys.is_empty() {
+                    failing
+                        .entry(label.to_owned())
+                        .or_default()
+                        .insert(project.name);
+                }
+                for key in failure.keys {
+                    failing.entry(key).or_default().insert(project.name);
+                }
+            }
+        }
+    }
+    if used.is_empty() {
+        return;
+    }
+    let _ = writeln!(out, "\n## Licenses across codebases\n");
+    let _ = writeln!(
+        out,
+        "| License | Category | Used in (packages) | Fails the policy in |"
+    );
+    let _ = writeln!(out, "|---|---|---|---|");
+    for (license, counts) in &used {
+        let category = joined(&categories_for([license.as_str()]));
+        let used_in = counts
+            .iter()
+            .map(|(name, count)| format!("{name}: {count}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let fails = failing.get(license).map_or_else(
+            || "—".to_owned(),
+            |names| names.iter().copied().collect::<Vec<_>>().join("; "),
+        );
+        let _ = writeln!(
+            out,
+            "| {license} | {} | {used_in} | {fails} |",
+            if category.is_empty() {
+                "—"
+            } else {
+                &category
+            }
+        );
+    }
+}
+
+/// Text safe inside a Markdown table cell: one line, no column breaks.
+fn table_cell(text: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace('|', "\\|")
 }
 
 fn footer(out: &mut String) {

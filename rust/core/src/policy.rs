@@ -41,6 +41,12 @@ pub struct Policy {
     pub allowed_categories: BTreeSet<String>,
     /// SPDX ids allowed for every package, whatever their category.
     pub allowed_licenses: BTreeSet<String>,
+    /// Categories replaced by the licenses they allowed when pinned: a license new to the
+    /// project in one of them fails, and its fix is to list the license, not the category.
+    pub pinned_categories: BTreeSet<String>,
+    /// Indexes, as [`index_key`] spells them, whose packages pass when they have no license or
+    /// one that can't be identified: an internal index serving the organisation's own code.
+    pub trusted_indexes: BTreeSet<String>,
     /// Canonical names exempted from the check entirely. Trusts the package, whatever its license;
     /// prefer `accepted_licenses`.
     pub ignored_packages: BTreeSet<String>,
@@ -78,6 +84,9 @@ pub struct PolicyResult {
     /// The policy names licenses, not categories, so a fix should too: suggesting a category
     /// would undo the pin.
     pub pinned: bool,
+    /// Categories pinned while others are still allowed whole: a failure in one of these is
+    /// fixed by listing its license, as under a full pin.
+    pub pinned_categories: BTreeSet<String>,
 }
 
 /// Why a package that fails the categories passes anyway.
@@ -90,6 +99,47 @@ pub enum PolicyException {
     },
     /// The package has no license and the policy allows that.
     Unlicensed { package: String },
+    /// The package has no identifiable license and comes from a trusted index.
+    TrustedIndex { package: String, index: String },
+}
+
+/// How an index URL is compared and written: without credentials or a trailing slash.
+#[must_use]
+pub fn index_key(url: &str) -> String {
+    crate::index_discovery::redact_url(url.trim())
+        .trim_end_matches('/')
+        .to_owned()
+}
+
+/// PyPI and its test instance: never offered as a trusted index, since everyone publishes there.
+#[must_use]
+pub fn is_public_index(url: &str) -> bool {
+    let host = url
+        .split_once("://")
+        .map_or(url, |(_, rest)| rest)
+        .split(['/', ':', '?'])
+        .next()
+        .unwrap_or("")
+        .to_lowercase();
+    [
+        "pypi.org",
+        "test.pypi.org",
+        "pypi.python.org",
+        "files.pythonhosted.org",
+    ]
+    .contains(&host.as_str())
+}
+
+/// Whether a trusted index would let `detected` pass: it came from one, its license is absent or
+/// unrecognised, and it was read (a failed lookup isn't "no license").
+#[must_use]
+pub fn trusted_by_index(detected: &DistributionLicence, trusted: &BTreeSet<String>) -> bool {
+    detected.keys.is_empty()
+        && !detected.unreadable
+        && detected
+            .index
+            .as_ref()
+            .is_some_and(|index| trusted.contains(index))
 }
 
 impl PolicyException {
@@ -107,6 +157,9 @@ impl PolicyException {
             Self::Unlicensed { package } => {
                 format!("  {package}: no license (allowed by allow-unlicensed)")
             }
+            Self::TrustedIndex { package, index } => {
+                format!("  {package}: no identified license, from {index} (trusted-indexes)")
+            }
         }
     }
 }
@@ -115,6 +168,12 @@ impl PolicyResult {
     #[must_use]
     pub fn passed(&self) -> bool {
         self.failures.is_empty()
+    }
+
+    /// Whether the fix for `failure` should name its license rather than its category.
+    #[must_use]
+    pub fn pinned_for(&self, failure: &DistributionLicence) -> bool {
+        self.pinned || !failure.categories.is_disjoint(&self.pinned_categories)
     }
 }
 
@@ -140,6 +199,23 @@ pub(crate) fn is_allowed(detected: &DistributionLicence, policy: &Policy) -> boo
 #[must_use]
 pub fn pin_licenses(detected: &[DistributionLicence], policy: &Policy) -> BTreeSet<String> {
     let mut pinned = policy.allowed_licenses.clone();
+    pinned.extend(pinnable_licenses(
+        detected,
+        policy,
+        &policy.allowed_categories,
+    ));
+    pinned
+}
+
+/// The licenses that let packages pass through `categories` today: what pinning just those
+/// categories adds to `allowed-licenses`.
+#[must_use]
+pub fn pinnable_licenses(
+    detected: &[DistributionLicence],
+    policy: &Policy,
+    categories: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let mut pinned = BTreeSet::new();
     for result in detected
         .iter()
         .filter(|result| !policy.ignored_packages.contains(&result.name))
@@ -151,7 +227,7 @@ pub fn pin_licenses(detected: &[DistributionLicence], policy: &Policy) -> BTreeS
                 .iter()
                 .filter(|key| {
                     categories_for([key.as_str()])
-                        .intersection(&policy.allowed_categories)
+                        .intersection(categories)
                         .next()
                         .is_some()
                 })
@@ -183,6 +259,12 @@ fn judge(detected: &DistributionLicence, policy: &Policy) -> Verdict {
     if policy.allow_unlicensed && detected.is_unlicensed() {
         return Verdict::Excepted(PolicyException::Unlicensed {
             package: detected.name.clone(),
+        });
+    }
+    if trusted_by_index(detected, &policy.trusted_indexes) {
+        return Verdict::Excepted(PolicyException::TrustedIndex {
+            package: detected.name.clone(),
+            index: detected.index.clone().unwrap_or_default(),
         });
     }
     Verdict::Failed
@@ -372,6 +454,7 @@ pub fn reevaluate(detected: &[DistributionLicence], policy: &Policy) -> PolicyRe
         compatibility_notes,
         exceptions,
         pinned: policy.allowed_categories.is_empty(),
+        pinned_categories: policy.pinned_categories.clone(),
     }
 }
 
@@ -421,18 +504,29 @@ pub fn format_remediation(failure: &DistributionLicence, pinned: bool) -> String
         if !failure.suggested.is_empty() {
             return format_suggestion(failure);
         }
+        let from_own_index = failure
+            .index
+            .as_ref()
+            .filter(|index| !is_public_index(index))
+            .map_or_else(String::new, |index| {
+                format!(
+                    "; or, if every such package from {index} is your own, add \"{index}\" to \
+                     trusted-indexes"
+                )
+            });
         if failure.declares_license && failure.keys.is_empty() {
             return format!(
                 "    -> a license is declared or shipped but could not be identified; read it yourself, \
                  then trust \"{}\" outright with ignored-packages if it is acceptable (allow-unlicensed \
-                 covers only packages with no license at all)",
+                 covers only packages with no license at all){from_own_index}",
                 failure.name
             );
         }
         if failure.keys.is_empty() {
             return format!(
                 "    -> no license could be detected; verify \"{}\" manually, then set \
-                 allow-unlicensed = true (or pass --allow-unlicensed) to allow packages that have none",
+                 allow-unlicensed = true (or pass --allow-unlicensed) to allow packages that have \
+                 none{from_own_index}",
                 failure.name
             );
         }
@@ -1202,6 +1296,86 @@ mod tests {
         );
         assert!(!pinned.contains("allowed-categories"), "{pinned}");
         assert!(format_remediation(&failure, false).contains("to allowed-categories"));
+    }
+
+    #[test]
+    fn pinning_one_category_keeps_todays_results_and_fails_only_its_newcomers() {
+        let policy = allowing(&["Permissive", "Copyleft Limited"]);
+        let found = [
+            licence("requests", &["Apache-2.0"], &["Permissive"], "metadata"),
+            licence("certifi", &["MPL-2.0"], &["Copyleft Limited"], "metadata"),
+        ];
+        let chosen = set(&["Copyleft Limited"]);
+        assert_eq!(
+            pinnable_licenses(&found, &policy, &chosen),
+            set(&["MPL-2.0"])
+        );
+        let pinned = Policy {
+            allowed_categories: set(&["Permissive"]),
+            allowed_licenses: pinnable_licenses(&found, &policy, &chosen),
+            pinned_categories: chosen,
+            ..Policy::default()
+        };
+        assert!(evaluated(&pinned, &found).passed());
+        let newcomers = [
+            licence("newmit", &["0BSD"], &["Permissive"], "metadata"),
+            licence(
+                "chardet",
+                &["LGPL-2.1-or-later"],
+                &["Copyleft Limited"],
+                "files",
+            ),
+            licence("gplpkg", &["GPL-3.0-only"], &["Copyleft"], "metadata"),
+        ];
+        let result = evaluated(&pinned, &newcomers);
+        let failed: Vec<&str> = result.failures.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(failed, ["chardet", "gplpkg"]);
+        // Only the pinned category's failure is told to list its license.
+        assert!(result.pinned_for(&result.failures[0]));
+        assert!(!result.pinned_for(&result.failures[1]));
+    }
+
+    #[test]
+    fn a_trusted_index_passes_only_its_packages_with_no_identified_license() {
+        let nexus = "https://nexus.example.com/simple";
+        let policy = Policy {
+            trusted_indexes: set(&[nexus]),
+            ..allowing(&["Permissive"])
+        };
+        let from = |mut result: DistributionLicence, index: &str| {
+            result.index = Some(index.to_owned());
+            result
+        };
+        let mut unreadable = from(licence("broken", &[], &[], "package index: 401"), nexus);
+        unreadable.unreadable = true;
+        let found = [
+            from(
+                licence("acme-core", &[], &[], "no license information found"),
+                nexus,
+            ),
+            from(
+                licence("acme-gpl", &["GPL-3.0-only"], &["Copyleft"], "metadata"),
+                nexus,
+            ),
+            unreadable,
+            from(
+                licence("stray", &[], &[], "no license information found"),
+                "https://idx/simple",
+            ),
+        ];
+        let result = evaluated(&policy, &found);
+        let failed: Vec<&str> = result.failures.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(failed, ["acme-gpl", "broken", "stray"]);
+        assert_eq!(
+            result.exceptions,
+            [PolicyException::TrustedIndex {
+                package: "acme-core".to_owned(),
+                index: nexus.to_owned(),
+            }]
+        );
+        assert_eq!(index_key("https://u:p@nexus.example.com/simple/"), nexus);
+        assert!(is_public_index("https://pypi.org/simple"));
+        assert!(!is_public_index(nexus));
     }
 
     #[test]

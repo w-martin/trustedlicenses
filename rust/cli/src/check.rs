@@ -57,7 +57,7 @@ pub fn print_result(ctx: &mut Context, result: &PolicyResult) {
         );
         for failure in &result.failures {
             term.echo(&format_failure(failure));
-            term.echo(&format_remediation(failure, result.pinned));
+            term.echo(&format_remediation(failure, result.pinned_for(failure)));
         }
     }
 }
@@ -169,6 +169,42 @@ fn note_ignored_packages(ctx: &mut Context, policy: &Policy) {
 }
 
 /// Check every package in the environment or lock file against the policy.
+/// `trustedlicenses setup`: guided setup on demand, over the current policy if there is one,
+/// then a check against what it wrote.
+pub fn setup(ctx: &mut Context, cli: &Cli) -> i32 {
+    if !should_offer_wizard(ctx, cli.quiet) {
+        return error_line(
+            ctx,
+            "setup asks questions, so it needs a terminal and can't run with --quiet.",
+        );
+    }
+    let pyproject = cli.pyproject.as_path();
+    let prior = match load_policy(pyproject) {
+        Ok(policy) => Some(policy),
+        Err(ConfigError::NoPolicyConfigured(_)) => None,
+        Err(error) => return error_line(ctx, error.message()),
+    };
+    let detected =
+        match select_package_set(cli).and_then(|set| gather(ctx, cli, &set, &BTreeSet::new())) {
+            Ok(gathered) => gathered.detections,
+            Err(message) => return error_line(ctx, &message),
+        };
+    match ctx
+        .wizard
+        .setup(&mut ctx.term, pyproject, &detected, prior.as_ref())
+    {
+        Err(_) => Halt::Aborted.exit_code(ctx),
+        Ok(None) => {
+            ctx.term.echo("Nothing written.");
+            0
+        }
+        Ok(Some(_)) => {
+            ctx.term.echo("");
+            check_environment(ctx, cli)
+        }
+    }
+}
+
 pub fn check_environment(ctx: &mut Context, cli: &Cli) -> i32 {
     let pyproject = cli.pyproject.as_path();
     let policy = match load_or_configure(ctx, cli) {

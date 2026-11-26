@@ -10,10 +10,11 @@ use trustedlicenses_core::detection::{
     canonical_name, inspect_distribution, prescan_licence_files, Distribution, DistributionLicence,
 };
 use trustedlicenses_core::index::{
-    fetch_distribution, Client, FetchOptions, IndexError, Response, MAX_WHEEL_BYTES,
+    fetch_distribution, in_tree_backend, Client, FetchOptions, IndexError, Response,
+    MAX_WHEEL_BYTES,
 };
 use trustedlicenses_core::index_discovery::{discover_index, redact_url, DiscoveryContext};
-use trustedlicenses_core::policy::detect_all;
+use trustedlicenses_core::policy::{detect_all, index_key};
 use trustedlicenses_core::sources::installed::{
     installed_distributions, resolve_environment, EnvironmentSpec,
 };
@@ -103,6 +104,7 @@ fn unresolved(package: &LockedPackage, reason: String) -> DistributionLicence {
 struct Fetched {
     name: String,
     version: String,
+    index: String,
     distribution: Distribution,
     from_installed: bool,
 }
@@ -136,6 +138,14 @@ fn installed_copies(cli: &Cli, project: &Path) -> Result<InstalledCopies, String
     Ok(copies)
 }
 
+/// The index a registry package is read from: the lock's, else the project's configured one.
+fn index_of(package: &LockedPackage, project: &Path, discovery: &DiscoveryContext) -> String {
+    match &package.source {
+        PackageSource::Registry(Some(url)) => url.clone(),
+        _ => discover_index(project, &package.name, discovery).url,
+    }
+}
+
 /// The I/O half of looking up a pinned package: find its index and fetch its license
 /// metadata. `Err` is the finished (failed-closed) detection for a package that cannot be
 /// read, so it never reaches the CPU-bound half.
@@ -153,14 +163,14 @@ fn fetch_locked(
             return Ok(Fetched {
                 name: package.name.clone(),
                 version: package.version.clone(),
+                index: index_of(package, project, discovery),
                 distribution: distribution.clone(),
                 from_installed: true,
             });
         }
     }
     let index = match &package.source {
-        PackageSource::Registry(Some(url)) => url.clone(),
-        PackageSource::Registry(None) => discover_index(project, &package.name, discovery).url,
+        PackageSource::Registry(_) => index_of(package, project, discovery),
         PackageSource::Git(location)
         | PackageSource::Url(location)
         | PackageSource::Path(location) => {
@@ -186,10 +196,15 @@ fn fetch_locked(
         .map(|distribution| Fetched {
             name: package.name.clone(),
             version: package.version.clone(),
+            index: index.clone(),
             distribution,
             from_installed: false,
         })
-        .map_err(|error| Box::new(unresolved(package, format!("package index: {error}"))))
+        .map_err(|error| {
+            let mut failed = unresolved(package, format!("package index: {error}"));
+            failed.index = Some(index_key(&index));
+            Box::new(failed)
+        })
 }
 
 /// The CPU half: detect the license from fetched metadata and bundled license files.
@@ -200,6 +215,13 @@ fn inspect_fetched(fetched: &Fetched) -> DistributionLicence {
     }
     if fetched.from_installed {
         detected.source.push_str(" [installed environment]");
+    }
+    detected.index = Some(index_key(&fetched.index));
+    if let Some(backend) = in_tree_backend(&fetched.distribution) {
+        detected.source.push_str(&format!(
+            " [source archive built by its own backend, {backend}: what installs may differ]"
+        ));
+        detected.in_tree_backend = Some(backend);
     }
     detected
 }
@@ -320,6 +342,22 @@ pub fn gather(
                     "Fetched {:.1} MB from the package index in {} request(s).",
                     traffic.bytes as f64 / 1e6,
                     traffic.requests
+                ));
+            }
+            let built_in_tree: Vec<String> = outcomes
+                .iter()
+                .filter_map(|outcome| outcome.as_ref().ok())
+                .filter_map(|fetched| {
+                    in_tree_backend(&fetched.distribution)
+                        .map(|backend| format!("{} {} ({backend})", fetched.name, fetched.version))
+                })
+                .collect();
+            if !built_in_tree.is_empty() {
+                ctx.term.echo(&format!(
+                    "i Read from a source archive that builds with its own backend at install time, \
+                     which may download or generate what actually installs, so its license may not \
+                     be the one read here: {}. Check what it installs.",
+                    built_in_tree.join(", ")
                 ));
             }
             prescan_licence_files(

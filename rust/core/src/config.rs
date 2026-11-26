@@ -276,7 +276,32 @@ pub fn load_policy(pyproject: &Path) -> Result<Policy, ConfigError> {
         }
         (found.cloned().unwrap_or_default(), pyproject.to_path_buf())
     };
+    build_policy(&section, &section_source, &document)
+}
 
+/// Load a policy from one file given directly, e.g. a shared policy applied to projects that
+/// have none of their own: a `[tool.trustedlicenses]` table if the file has one, else the
+/// file's top level, as in a standalone `trustedlicenses.toml`.
+///
+/// # Errors
+///
+/// `Invalid` when the file is unreadable, malformed, or its policy is, as for [`load_policy`].
+pub fn load_policy_file(path: &Path) -> Result<Policy, ConfigError> {
+    let document = read_toml(path)?;
+    let section = document
+        .get(CONFIG_SECTION[0])
+        .and_then(|tool| tool.get(CONFIG_SECTION[1]))
+        .and_then(toml::Value::as_table)
+        .unwrap_or(&document)
+        .clone();
+    build_policy(&section, path, &document)
+}
+
+fn build_policy(
+    section: &toml::Table,
+    section_source: &Path,
+    document: &toml::Table,
+) -> Result<Policy, ConfigError> {
     let allowed: Vec<&toml::Value> = match section.get("allowed-categories") {
         None => Vec::new(),
         Some(raw) => raw
@@ -291,7 +316,7 @@ pub fn load_policy(pyproject: &Path) -> Result<Policy, ConfigError> {
             .iter()
             .collect(),
     };
-    let allowed_licenses = allowed_licenses(&section, &section_source)?;
+    let allowed_licenses = allowed_licenses(section, section_source)?;
     if allowed.is_empty() && allowed_licenses.is_empty() {
         return Err(invalid(format!(
             "{} needs a non-empty allowed-categories (or allowed-licenses) list, e.g.:\n\n  \
@@ -326,6 +351,14 @@ pub fn load_policy(pyproject: &Path) -> Result<Policy, ConfigError> {
         )));
     }
 
+    let allowed_categories: BTreeSet<String> = allowed
+        .iter()
+        .filter_map(|c| c.as_str())
+        .map(str::to_owned)
+        .collect();
+    let pinned_categories = pinned_categories(section, section_source, &allowed_categories)?;
+    let trusted_indexes = trusted_indexes(section, section_source)?;
+
     let ignored_packages = section
         .get("ignored-packages")
         .map(|raw| {
@@ -348,24 +381,117 @@ pub fn load_policy(pyproject: &Path) -> Result<Policy, ConfigError> {
         .unwrap_or_default();
 
     Ok(Policy {
-        accepted_licenses: accepted_licenses(&section, &section_source)?,
-        allow_unlicensed: allow_unlicensed(&section, &section_source)?,
-        allowed_categories: allowed
-            .iter()
-            .filter_map(|c| c.as_str())
-            .map(str::to_owned)
-            .collect(),
+        accepted_licenses: accepted_licenses(section, section_source)?,
+        allow_unlicensed: allow_unlicensed(section, section_source)?,
+        allowed_categories,
         allowed_licenses,
+        pinned_categories,
+        trusted_indexes,
         ignored_packages,
-        project_license_keys: project_license_keys(&document),
+        project_license_keys: project_license_keys(document),
         trust_corrected_licenses: section
             .get("trust-corrected-licenses")
             .and_then(toml::Value::as_bool)
             .unwrap_or(false),
-        verified_packages: verified_packages(&section, &section_source)?,
-        verified_statements: verified_statements(&section, &section_source)?,
-        use_case: use_case(&section, &section_source)?,
+        verified_packages: verified_packages(section, section_source)?,
+        verified_statements: verified_statements(section, section_source)?,
+        use_case: use_case(section, section_source)?,
     })
+}
+
+/// `trusted-indexes`: index URLs whose packages pass with no identifiable license.
+fn trusted_indexes(section: &toml::Table, source: &Path) -> Result<BTreeSet<String>, ConfigError> {
+    let Some(raw) = section.get("trusted-indexes") else {
+        return Ok(BTreeSet::new());
+    };
+    let shape = || {
+        invalid(format!(
+            "{}: trusted-indexes must be a list of index URLs, e.g.\n\n  \
+             trusted-indexes = [\"https://nexus.example.com/repository/pypi-internal/simple\"]",
+            source.display()
+        ))
+    };
+    let mut trusted = BTreeSet::new();
+    for value in raw.as_array().ok_or_else(shape)? {
+        let url = value.as_str().ok_or_else(shape)?;
+        if !(url.starts_with("https://") || url.starts_with("http://")) {
+            return Err(invalid(format!(
+                "{}: trusted-indexes entry {} isn't an http(s) URL.",
+                source.display(),
+                py_repr(url)
+            )));
+        }
+        let key = crate::policy::index_key(url);
+        if key != url.trim().trim_end_matches('/') {
+            return Err(invalid(format!(
+                "{}: a trusted-indexes entry carries credentials; write it as {} and keep \
+                 credentials in your pip, uv or keyring configuration.",
+                source.display(),
+                py_repr(&key)
+            )));
+        }
+        if crate::policy::is_public_index(&key) {
+            return Err(invalid(format!(
+                "{}: trusted-indexes can't include {}: anyone can publish there.",
+                source.display(),
+                py_repr(&key)
+            )));
+        }
+        trusted.insert(key);
+    }
+    Ok(trusted)
+}
+
+/// `pinned-categories`: categories whose licenses `pin` moved into `allowed-licenses`, so a
+/// license new to the project in one of them fails until someone accepts it.
+fn pinned_categories(
+    section: &toml::Table,
+    source: &Path,
+    allowed: &BTreeSet<String>,
+) -> Result<BTreeSet<String>, ConfigError> {
+    let Some(raw) = section.get("pinned-categories") else {
+        return Ok(BTreeSet::new());
+    };
+    let shape = || {
+        invalid(format!(
+            "{}: pinned-categories must be a list of category names, e.g.\n\n  \
+             pinned-categories = [\"Copyleft Limited\"]",
+            source.display()
+        ))
+    };
+    let pinned: BTreeSet<String> = raw
+        .as_array()
+        .ok_or_else(shape)?
+        .iter()
+        .map(|name| name.as_str().map(str::to_owned).ok_or_else(shape))
+        .collect::<Result<_, _>>()?;
+    let known = known_categories();
+    let unknown: Vec<String> = pinned
+        .iter()
+        .filter(|name| !known.contains(*name))
+        .map(|name| py_repr(name))
+        .collect();
+    if !unknown.is_empty() {
+        return Err(invalid(format!(
+            "{}: unknown pinned-categories {}.\nSee {DOCS_URL} for the full category vocabulary.",
+            source.display(),
+            unknown.join(", ")
+        )));
+    }
+    let both: Vec<String> = pinned
+        .intersection(allowed)
+        .map(|name| py_repr(name))
+        .collect();
+    if !both.is_empty() {
+        return Err(invalid(format!(
+            "{}: {} {} in both allowed-categories and pinned-categories. A pinned category \
+             allows only the licenses listed in allowed-licenses; remove it from one of the two.",
+            source.display(),
+            both.join(", "),
+            if both.len() == 1 { "is" } else { "are" }
+        )));
+    }
+    Ok(pinned)
 }
 
 fn allowed_licenses(section: &toml::Table, source: &Path) -> Result<BTreeSet<String>, ConfigError> {
@@ -539,7 +665,10 @@ pub fn write_policy(
         pyproject,
         &NewPolicy {
             allowed_categories,
-            pinned_licenses: None,
+            pinned_categories: &[],
+            pinned_licenses: &BTreeSet::new(),
+            allow_unlicensed: false,
+            trusted_indexes: &[],
             ignored_packages,
             use_case,
         },
@@ -547,28 +676,278 @@ pub fn write_policy(
     )
 }
 
-/// What the setup wizard writes. With `pinned_licenses`, the policy lists those as
-/// `allowed-licenses` instead of `allowed_categories`.
+/// What the setup wizard writes. Categories in `pinned_categories` are written as the
+/// licenses in `pinned_licenses` instead, and recorded as pinned.
 pub struct NewPolicy<'a> {
     pub allowed_categories: &'a [String],
-    pub pinned_licenses: Option<&'a BTreeSet<String>>,
+    pub pinned_categories: &'a [String],
+    pub pinned_licenses: &'a BTreeSet<String>,
+    /// Writes `allow-unlicensed = true`.
+    pub allow_unlicensed: bool,
+    pub trusted_indexes: &'a [String],
     pub ignored_packages: &'a [String],
     pub use_case: Option<UseCase>,
 }
 
 impl NewPolicy<'_> {
-    fn allowance(&self) -> (&'static str, Item) {
-        match self.pinned_licenses {
-            Some(licenses) => (
-                "allowed-licenses",
-                Item::Value(Value::Array(licenses_array(licenses))),
-            ),
-            None => (
+    /// The keys that say what's allowed, in the order they're written.
+    fn allowance(&self) -> Vec<(&'static str, Item)> {
+        let whole: Vec<String> = self
+            .allowed_categories
+            .iter()
+            .filter(|category| !self.pinned_categories.contains(category))
+            .cloned()
+            .collect();
+        let mut keys = Vec::new();
+        if !whole.is_empty() {
+            keys.push((
                 "allowed-categories",
-                Item::Value(string_array(self.allowed_categories).into()),
-            ),
+                Item::Value(string_array(&whole).into()),
+            ));
+        }
+        if !self.pinned_licenses.is_empty() {
+            keys.push((
+                "allowed-licenses",
+                Item::Value(Value::Array(licenses_array(self.pinned_licenses))),
+            ));
+        }
+        if !self.pinned_categories.is_empty() {
+            keys.push((
+                "pinned-categories",
+                Item::Value(string_array(self.pinned_categories).into()),
+            ));
+        }
+        if self.allow_unlicensed {
+            keys.push(("allow-unlicensed", Item::Value(true.into())));
+        }
+        if !self.trusted_indexes.is_empty() {
+            keys.push((
+                "trusted-indexes",
+                Item::Value(string_array(self.trusted_indexes).into()),
+            ));
+        }
+        keys
+    }
+}
+
+/// Split the text before an array element into the comment that ends the previous element's
+/// line (`" # note"` after its comma) and the rest, which belongs to this element.
+fn split_after_comma(text: &str) -> (&str, &str) {
+    match text.find('\n') {
+        Some(end) if text[..end].contains('#') => (&text[..end], &text[end..]),
+        _ => ("", text),
+    }
+}
+
+/// Keep only the elements `keep` accepts, each with its own comments: in TOML a comment after an
+/// element's comma is parsed into the next element's prefix, so a plain `retain` would move it.
+fn retain_keeping_comments(array: &mut Array, keep: impl Fn(&Value) -> bool) {
+    let prefixes: Vec<String> = array
+        .iter()
+        .map(|value| {
+            value
+                .decor()
+                .prefix()
+                .and_then(|raw| raw.as_str())
+                .unwrap_or("")
+                .to_owned()
+        })
+        .collect();
+    let trailing = array.trailing().as_str().unwrap_or("").to_owned();
+    let count = prefixes.len();
+    let lead: Vec<String> = (0..count)
+        .map(|index| {
+            if index == 0 {
+                prefixes[0].clone()
+            } else {
+                split_after_comma(&prefixes[index]).1.to_owned()
+            }
+        })
+        .collect();
+    let tail: Vec<String> = (0..count)
+        .map(|index| {
+            let next = prefixes.get(index + 1).unwrap_or(&trailing);
+            split_after_comma(next).0.to_owned()
+        })
+        .collect();
+    let closing = split_after_comma(&trailing).1.to_owned();
+    let kept: Vec<(usize, Value)> = array
+        .iter()
+        .enumerate()
+        .filter(|(_, value)| keep(value))
+        .map(|(index, value)| (index, value.clone()))
+        .collect();
+    array.clear();
+    let mut previous: Option<usize> = None;
+    for (index, mut value) in kept {
+        let own = &lead[index];
+        let prefix = match previous {
+            None if own.contains('\n') || own.contains('#') => own.clone(),
+            None => lead[0].clone(),
+            Some(before) => format!("{}{own}", tail[before]),
+        };
+        value.decor_mut().set_prefix(prefix);
+        array.push_formatted(value);
+        previous = Some(index);
+    }
+    let last = previous.map_or("", |index| tail[index].as_str());
+    array.set_trailing(format!("{last}{closing}"));
+}
+
+/// `old` turned into `new`, keeping the comments on the elements that stay and the layout:
+/// elements not in `new` go, and ones new to it are added at the end.
+fn merge_array(old: &Array, new: &Array) -> Array {
+    let wanted: Vec<String> = new
+        .iter()
+        .filter_map(|value| value.as_str().map(str::to_owned))
+        .collect();
+    let mut merged = old.clone();
+    retain_keeping_comments(&mut merged, |value| {
+        value
+            .as_str()
+            .is_some_and(|text| wanted.iter().any(|w| w == text))
+    });
+    let multiline = merged
+        .iter()
+        .next()
+        .and_then(|value| value.decor().prefix().and_then(|raw| raw.as_str()))
+        .is_some_and(|prefix| prefix.contains('\n'))
+        || (merged.is_empty() && old.trailing().as_str().is_some_and(|t| t.contains('\n')));
+    for name in &wanted {
+        if !merged.iter().any(|value| value.as_str() == Some(name)) {
+            // The comment after the current last element sits in the trailing text; once an
+            // element follows, it belongs in that element's prefix.
+            let trailing = merged.trailing().as_str().unwrap_or("").to_owned();
+            let (comment, rest) = split_after_comma(&trailing);
+            let (comment, rest) = (comment.to_owned(), rest.to_owned());
+            merged.push(name.as_str());
+            if multiline {
+                if let Some(value) = merged.get_mut(merged.len() - 1) {
+                    value.decor_mut().set_prefix(format!("{comment}\n    "));
+                }
+                merged.set_trailing(rest);
+            }
         }
     }
+    if multiline {
+        let trailing = merged.trailing().as_str().unwrap_or("").to_owned();
+        if !trailing.contains('\n') {
+            merged.set_trailing(format!("{trailing}\n"));
+        }
+        merged.set_trailing_comma(true);
+    }
+    merged
+}
+
+/// A setup key's new value, written over its old one: an unchanged value is kept as it was, an
+/// array is merged so its elements keep their comments, and anything else keeps the old
+/// value's trailing comment.
+fn carry_over(old: &Item, new: Item) -> Item {
+    match (old.as_value(), new.as_value()) {
+        (Some(Value::Array(old)), Some(Value::Array(fresh))) => {
+            let mut merged = merge_array(old, fresh);
+            *merged.decor_mut() = old.decor().clone();
+            Item::Value(Value::Array(merged))
+        }
+        (Some(old_value), Some(new_value)) => {
+            if old_value.to_string().trim() == new_value.to_string().trim() {
+                return Item::Value(old_value.clone());
+            }
+            let mut value = new_value.clone();
+            if let Some(suffix) = old_value.decor().suffix() {
+                value.decor_mut().set_suffix(suffix.clone());
+            }
+            Item::Value(value)
+        }
+        _ => new,
+    }
+}
+
+/// The keys guided setup answers, which a re-run replaces.
+const SETUP_KEYS: [&str; 6] = [
+    "use-case",
+    "allowed-categories",
+    "allowed-licenses",
+    "pinned-categories",
+    "allow-unlicensed",
+    "trusted-indexes",
+];
+
+/// The package-by-package decisions a review records, which a re-run of setup may keep.
+const PACKAGE_KEYS: [&str; 5] = [
+    "accepted-licenses",
+    "ignored-packages",
+    "verified-packages",
+    "verified-statements",
+    "trust-corrected-licenses",
+];
+
+/// Replace what guided setup answers in an existing policy with `policy`, keeping any other
+/// keys and, with `keep_package_entries`, the package-by-package decisions from reviews.
+/// Comments above the old allowance carry over to the new one.
+///
+/// # Errors
+///
+/// `Invalid` when the file is unreadable, malformed, has no policy table, or can't be written.
+pub fn rewrite_policy(
+    path: &Path,
+    policy: &NewPolicy<'_>,
+    keep_package_entries: bool,
+) -> Result<(), ConfigError> {
+    let (mut document, _) = parse_document(path)?;
+    {
+        let section = policy_table(&mut document, path)?;
+        let entries: Vec<(toml_edit::Key, Item)> = section
+            .iter()
+            .map(|(name, _)| name.to_owned())
+            .collect::<Vec<_>>()
+            .into_iter()
+            .filter_map(|name| {
+                let key = section.key(&name)?.clone();
+                let item = section.remove(&name)?;
+                Some((key, item))
+            })
+            .collect();
+        let mut fresh = Vec::new();
+        if let Some(case) = policy.use_case {
+            fresh.push(("use-case", Item::Value(case.as_str().into())));
+        }
+        fresh.extend(policy.allowance());
+        let written: Vec<&str> = fresh.iter().map(|(key, _)| *key).collect();
+        // Comments above a setup key that's no longer written move to the first one that is.
+        let orphaned: String = entries
+            .iter()
+            .filter(|(key, _)| SETUP_KEYS.contains(&key.get()) && !written.contains(&key.get()))
+            .filter_map(|(key, _)| key.leaf_decor().prefix().and_then(|raw| raw.as_str()))
+            .filter(|prefix| prefix.contains('#'))
+            .collect();
+        for (index, (name, item)) in fresh.into_iter().enumerate() {
+            let old = entries.iter().find(|(key, _)| key.get() == name);
+            let (mut key, item) = match old {
+                Some((key, old_item)) => (key.clone(), carry_over(old_item, item)),
+                None => (toml_edit::Key::new(name), item),
+            };
+            if index == 0 && !orphaned.is_empty() {
+                let own = key
+                    .leaf_decor()
+                    .prefix()
+                    .and_then(|raw| raw.as_str())
+                    .unwrap_or("")
+                    .to_owned();
+                key.leaf_decor_mut().set_prefix(format!("{orphaned}{own}"));
+            }
+            section.entry_format(&key).or_insert(item);
+        }
+        for (key, item) in entries {
+            let name = key.get();
+            if SETUP_KEYS.contains(&name) || (!keep_package_entries && PACKAGE_KEYS.contains(&name))
+            {
+                continue;
+            }
+            section.entry_format(&key).or_insert(item);
+        }
+    }
+    fs::write(path, document.to_string()).map_err(|error| io_error(path, &error))
 }
 
 /// One id per line: a pinned list is long, and a reviewer reads its diff line by line.
@@ -598,14 +977,16 @@ pub fn write_new_policy(
         use_case,
         ..
     } = *policy;
-    let (allowance_key, allowance) = policy.allowance();
+    let allowance = policy.allowance();
     if standalone {
         let target = standalone_path(pyproject);
         let mut document = DocumentMut::new();
         if let Some(case) = use_case {
             document["use-case"] = Item::Value(case.as_str().into());
         }
-        document[allowance_key] = allowance;
+        for (key, item) in allowance {
+            document[key] = item;
+        }
         if !ignored_packages.is_empty() {
             document["ignored-packages"] = Item::Value(string_array(ignored_packages).into());
         }
@@ -625,7 +1006,9 @@ pub fn write_new_policy(
     if let Some(case) = use_case {
         section["use-case"] = Item::Value(case.as_str().into());
     }
-    section[allowance_key] = allowance;
+    for (key, item) in allowance {
+        section[key] = item;
+    }
     if !ignored_packages.is_empty() {
         section["ignored-packages"] = Item::Value(string_array(ignored_packages).into());
     }
@@ -923,6 +1306,8 @@ pub struct PolicyAdditions {
     pub accepted_licenses: Vec<(String, String)>,
     /// Sets `allow-unlicensed = true`.
     pub allow_unlicensed: bool,
+    /// Index URLs for `trusted-indexes`.
+    pub trusted_indexes: Vec<String>,
     /// Package name -> one-line reason, recorded as a comment on its new entry.
     pub reasons: HashMap<String, String>,
     pub trust: Option<CorrectionTrust>,
@@ -953,6 +1338,9 @@ pub fn add_to_policy(path: &Path, additions: &PolicyAdditions) -> Result<(), Con
         }
         if additions.allow_unlicensed {
             set_value(section, "allow-unlicensed", true.into());
+        }
+        if !additions.trusted_indexes.is_empty() {
+            extend_unique(section, "trusted-indexes", &additions.trusted_indexes)?;
         }
         if let Some(trust) = &additions.trust {
             if let Some(enabled) = trust.enabled {
@@ -1047,23 +1435,32 @@ fn keep_one_per_line(section: &mut dyn TableLike, key: &str) {
     array.set_trailing_comma(true);
 }
 
-/// Replace a policy's `allowed-categories` with `licenses` as `allowed-licenses`, keeping
-/// everything else in the file, comments included, as it was.
+/// Pin `categories`: take them out of `allowed-categories`, add `licenses` (those they let
+/// pass today) to `allowed-licenses`, and record them in `pinned-categories`. Pinning every
+/// category puts `allowed-licenses` where `allowed-categories` was. Everything else in the
+/// file, comments included, stays as it was.
 ///
 /// # Errors
 ///
-/// `Invalid` when `licenses` is empty (the policy would allow nothing), when the file has no
-/// policy table, or on an I/O or parse failure.
-pub fn pin_policy(path: &Path, licenses: &BTreeSet<String>) -> Result<(), ConfigError> {
-    if licenses.is_empty() {
-        return Err(invalid(format!(
-            "{}: no licenses to pin -- nothing currently passes through allowed-categories.",
-            path.display()
-        )));
-    }
+/// `Invalid` when the policy would allow nothing afterwards, when the file has no policy
+/// table, or on an I/O or parse failure.
+pub fn pin_policy(
+    path: &Path,
+    categories: &BTreeSet<String>,
+    licenses: &BTreeSet<String>,
+) -> Result<(), ConfigError> {
     let (mut document, _) = parse_document(path)?;
     {
         let section = policy_table(&mut document, path)?;
+        let current: Vec<String> = match section.get("allowed-categories") {
+            None => Vec::new(),
+            Some(item) => item
+                .as_array()
+                .ok_or_else(|| not_an_array("allowed-categories"))?
+                .iter()
+                .filter_map(|name| name.as_str().map(str::to_owned))
+                .collect(),
+        };
         let mut merged = licenses.clone();
         if let Some(existing) = section.get("allowed-licenses") {
             let array = existing
@@ -1071,9 +1468,89 @@ pub fn pin_policy(path: &Path, licenses: &BTreeSet<String>) -> Result<(), Config
                 .ok_or_else(|| not_an_array("allowed-licenses"))?;
             merged.extend(array.iter().filter_map(|id| id.as_str().map(str::to_owned)));
         }
-        replace_categories(section, Value::Array(licenses_array(&merged)));
+        let remaining = current
+            .iter()
+            .filter(|name| !categories.contains(*name))
+            .count();
+        if remaining == 0 {
+            if merged.is_empty() {
+                return Err(invalid(format!(
+                    "{}: no licenses to pin -- nothing currently passes through allowed-categories.",
+                    path.display()
+                )));
+            }
+            replace_categories(section, Value::Array(licenses_array(&merged)));
+        } else {
+            if let Some(array) = section
+                .get_mut("allowed-categories")
+                .and_then(Item::as_array_mut)
+            {
+                retain_keeping_comments(array, |name| {
+                    !name.as_str().is_some_and(|name| categories.contains(name))
+                });
+            }
+            if section.get("allowed-licenses").is_some() {
+                let ids: Vec<String> = licenses.iter().cloned().collect();
+                extend_unique(section, "allowed-licenses", &ids)?;
+                keep_one_per_line(section, "allowed-licenses");
+            } else if !licenses.is_empty() {
+                insert_after(
+                    section,
+                    "allowed-categories",
+                    "allowed-licenses",
+                    Item::Value(Value::Array(licenses_array(licenses))),
+                );
+            }
+        }
+        if section.get("pinned-categories").is_some() {
+            let names: Vec<String> = categories.iter().cloned().collect();
+            extend_unique(section, "pinned-categories", &names)?;
+        } else {
+            let names: Vec<String> = categories.iter().cloned().collect();
+            let after = if section.get("allowed-licenses").is_some() {
+                "allowed-licenses"
+            } else {
+                "allowed-categories"
+            };
+            insert_after(
+                section,
+                after,
+                "pinned-categories",
+                Item::Value(string_array(&names).into()),
+            );
+        }
     }
     fs::write(path, document.to_string()).map_err(|error| io_error(path, &error))
+}
+
+/// Insert `key` right after `after`, or at the end when `after` isn't there, so related keys
+/// stay together.
+fn insert_after(section: &mut dyn TableLike, after: &str, key: &str, item: Item) {
+    if section.get(after).is_none() {
+        section.insert(key, item);
+        return;
+    }
+    let entries: Vec<(toml_edit::Key, Item)> = section
+        .iter()
+        .map(|(name, _)| name.to_owned())
+        .collect::<Vec<_>>()
+        .into_iter()
+        .filter_map(|name| {
+            let existing = section.key(&name)?.clone();
+            let value = section.remove(&name)?;
+            Some((existing, value))
+        })
+        .collect();
+    let mut item = Some(item);
+    for (existing, value) in entries {
+        let found = existing.get() == after;
+        section.entry_format(&existing).or_insert(value);
+        if found {
+            if let Some(item) = item.take() {
+                section.insert(key, item);
+            }
+        }
+    }
 }
 
 /// Put `licenses` where `allowed-categories` was, keeping the comments around it: the key's
@@ -1090,8 +1567,23 @@ fn replace_categories(section: &mut dyn TableLike, mut licenses: Value) {
         licenses.decor_mut().set_suffix(suffix);
     }
     if section.get("allowed-licenses").is_some() || old_key_decor.is_none() {
+        let carried = old_key_decor
+            .as_ref()
+            .and_then(|decor| decor.prefix())
+            .and_then(|raw| raw.as_str())
+            .filter(|prefix| prefix.contains('#'))
+            .map(str::to_owned);
         section.remove("allowed-categories");
         section.insert("allowed-licenses", Item::Value(licenses));
+        if let (Some(carried), Some(mut key)) = (carried, section.key_mut("allowed-licenses")) {
+            let own = key
+                .leaf_decor()
+                .prefix()
+                .and_then(|raw| raw.as_str())
+                .unwrap_or("")
+                .to_owned();
+            key.leaf_decor_mut().set_prefix(format!("{carried}{own}"));
+        }
         return;
     }
     // Rebuild the table in order so the new key takes the old one's place.
@@ -2066,7 +2558,7 @@ mod tests {
              allowed-categories = [\"Permissive\"]\nallowed-licenses = [\"MPL-2.0\"]\n\
              ignored-packages = [\"a\"] # reviewed\n",
         );
-        pin_policy(&path, &set(&["MIT", "BSD-3-Clause"])).expect("pin");
+        pin_policy(&path, &set(&["Permissive"]), &set(&["MIT", "BSD-3-Clause"])).expect("pin");
         let written = fs::read_to_string(&path).expect("read");
         assert!(written.contains("# keep me"), "{written}");
         assert!(
@@ -2091,7 +2583,7 @@ mod tests {
     fn pinning_nothing_is_refused_and_leaves_the_file_alone() {
         let tmp = tempdir().expect("tempdir");
         let path = pyproject(&tmp, PERMISSIVE);
-        let error = pin_policy(&path, &BTreeSet::new()).expect_err("error");
+        let error = pin_policy(&path, &set(&["Permissive"]), &BTreeSet::new()).expect_err("error");
         assert!(error.message().contains("no licenses to pin"));
         assert_eq!(fs::read_to_string(&path).expect("read"), PERMISSIVE);
     }
@@ -2139,11 +2631,11 @@ mod tests {
              # agreed with legal, 2026-11\nallowed-categories = [\"Permissive\"] # see JIRA-1\n\
              ignored-packages = [\"a\"]\n",
         );
-        pin_policy(&path, &set(&["MIT"])).expect("pin");
+        pin_policy(&path, &set(&["Permissive"]), &set(&["MIT"])).expect("pin");
         let written = fs::read_to_string(&path).expect("read");
         assert!(
             written.contains(
-                "use-case = \"product\"\n# agreed with legal, 2026-11\nallowed-licenses = [\n    \"MIT\",\n] # see JIRA-1\nignored-packages"
+                "use-case = \"product\"\n# agreed with legal, 2026-11\nallowed-licenses = [\n    \"MIT\",\n] # see JIRA-1\npinned-categories = [\"Permissive\"]\nignored-packages"
             ),
             "{written}"
         );
@@ -2158,7 +2650,7 @@ mod tests {
             "# Licenses for the data pipeline\nallowed-categories = [\"Permissive\"]\n",
         )
         .expect("write");
-        pin_policy(&path, &set(&["MIT"])).expect("pin");
+        pin_policy(&path, &set(&["Permissive"]), &set(&["MIT"])).expect("pin");
         let written = fs::read_to_string(&path).expect("read");
         assert!(
             written.starts_with("# Licenses for the data pipeline\nallowed-licenses = ["),
@@ -2223,7 +2715,10 @@ mod tests {
             &path,
             &NewPolicy {
                 allowed_categories: &strings(&["Permissive"]),
-                pinned_licenses: Some(&licenses),
+                pinned_categories: &strings(&["Permissive"]),
+                pinned_licenses: &licenses,
+                allow_unlicensed: false,
+                trusted_indexes: &[],
                 ignored_packages: &[],
                 use_case: Some(UseCase::Product),
             },
@@ -2233,13 +2728,45 @@ mod tests {
         let policy = load_policy(&path).expect("policy");
         assert!(policy.allowed_categories.is_empty());
         assert_eq!(policy.allowed_licenses, licenses);
+        assert_eq!(policy.pinned_categories, set(&["Permissive"]));
+    }
+
+    #[test]
+    fn a_new_policy_can_pin_some_categories_and_keep_the_rest() {
+        let tmp = tempdir().expect("tempdir");
+        let path = pyproject(&tmp, "[project]\nname = 'x'\n");
+        let licenses = set(&["MPL-2.0"]);
+        write_new_policy(
+            &path,
+            &NewPolicy {
+                allowed_categories: &strings(&["Permissive", "Copyleft Limited"]),
+                pinned_categories: &strings(&["Copyleft Limited"]),
+                pinned_licenses: &licenses,
+                allow_unlicensed: false,
+                trusted_indexes: &[],
+                ignored_packages: &[],
+                use_case: None,
+            },
+            false,
+        )
+        .expect("write");
+        let written = fs::read_to_string(&path).expect("read");
+        assert!(
+            written.contains(
+                "allowed-categories = [\"Permissive\"]\nallowed-licenses = [\n    \"MPL-2.0\",\n]\npinned-categories = [\"Copyleft Limited\"]\n"
+            ),
+            "{written}"
+        );
+        let policy = load_policy(&path).expect("policy");
+        assert_eq!(policy.allowed_categories, set(&["Permissive"]));
+        assert_eq!(policy.pinned_categories, set(&["Copyleft Limited"]));
     }
 
     #[test]
     fn licenses_added_to_a_pinned_list_stay_one_per_line() {
         let tmp = tempdir().expect("tempdir");
         let path = pyproject(&tmp, PERMISSIVE);
-        pin_policy(&path, &set(&["MIT"])).expect("pin");
+        pin_policy(&path, &set(&["Permissive"]), &set(&["MIT"])).expect("pin");
         let additions = PolicyAdditions {
             allowed_licenses: strings(&["Apache-2.0"]),
             ..PolicyAdditions::default()
@@ -2278,5 +2805,269 @@ mod tests {
             "{}",
             error.message()
         );
+    }
+
+    #[test]
+    fn pinning_one_category_keeps_the_others_and_records_it() {
+        let tmp = tempdir().expect("tempdir");
+        let path = pyproject(
+            &tmp,
+            "[tool.trustedlicenses]\n# agreed with legal\n\
+             allowed-categories = [\"Copyleft Limited\", \"Permissive\"] # JIRA-1\n\
+             ignored-packages = [\"a\"]\n",
+        );
+        pin_policy(&path, &set(&["Copyleft Limited"]), &set(&["MPL-2.0"])).expect("pin");
+        let written = fs::read_to_string(&path).expect("read");
+        assert_eq!(
+            written,
+            "[tool.trustedlicenses]\n# agreed with legal\n\
+             allowed-categories = [\"Permissive\"] # JIRA-1\n\
+             allowed-licenses = [\n    \"MPL-2.0\",\n]\n\
+             pinned-categories = [\"Copyleft Limited\"]\n\
+             ignored-packages = [\"a\"]\n"
+        );
+        let policy = load_policy(&path).expect("policy");
+        assert_eq!(policy.allowed_categories, set(&["Permissive"]));
+        assert_eq!(policy.pinned_categories, set(&["Copyleft Limited"]));
+
+        // Pinning the rest afterwards keeps the comment and adds to what was pinned.
+        pin_policy(&path, &set(&["Permissive"]), &set(&["MIT"])).expect("pin");
+        let written = fs::read_to_string(&path).expect("read");
+        assert!(
+            written.contains(
+                "# agreed with legal\nallowed-licenses = [\n    \"MIT\",\n    \"MPL-2.0\",\n] # JIRA-1\n"
+            ),
+            "{written}"
+        );
+        let policy = load_policy(&path).expect("policy");
+        assert!(policy.allowed_categories.is_empty());
+        assert_eq!(
+            policy.pinned_categories,
+            set(&["Copyleft Limited", "Permissive"])
+        );
+    }
+
+    #[test]
+    fn pinning_a_category_nothing_uses_still_pins_it() {
+        let tmp = tempdir().expect("tempdir");
+        let path = pyproject(
+            &tmp,
+            "[tool.trustedlicenses]\nallowed-categories = [\"Permissive\", \"Copyleft Limited\"]\n",
+        );
+        pin_policy(&path, &set(&["Copyleft Limited"]), &BTreeSet::new()).expect("pin");
+        assert_eq!(
+            fs::read_to_string(&path).expect("read"),
+            "[tool.trustedlicenses]\nallowed-categories = [\"Permissive\"]\n\
+             pinned-categories = [\"Copyleft Limited\"]\n"
+        );
+        let policy = load_policy(&path).expect("policy");
+        assert_eq!(policy.allowed_categories, set(&["Permissive"]));
+        assert!(policy.allowed_licenses.is_empty());
+        assert_eq!(policy.pinned_categories, set(&["Copyleft Limited"]));
+    }
+
+    #[test]
+    fn pinned_categories_must_be_known_and_not_also_allowed() {
+        let error = load(
+            "[tool.trustedlicenses]\nallowed-categories = [\"Permissive\"]\npinned-categories = [\"Nope\"]\n",
+        )
+        .expect_err("error");
+        assert!(
+            error.message().contains("unknown pinned-categories 'Nope'"),
+            "{}",
+            error.message()
+        );
+        let error = load(
+            "[tool.trustedlicenses]\nallowed-categories = [\"Permissive\"]\npinned-categories = [\"Permissive\"]\n",
+        )
+        .expect_err("error");
+        assert!(
+            error
+                .message()
+                .contains("'Permissive' is in both allowed-categories and pinned-categories"),
+            "{}",
+            error.message()
+        );
+    }
+
+    #[test]
+    fn a_policy_file_given_directly_may_be_standalone_or_a_pyproject() {
+        let tmp = tempdir().expect("tempdir");
+        let shared = tmp.path().join("org-policy.toml");
+        fs::write(&shared, "allowed-categories = [\"Permissive\"]\n").expect("write");
+        assert_eq!(
+            load_policy_file(&shared)
+                .expect("policy")
+                .allowed_categories,
+            set(&["Permissive"])
+        );
+        let path = pyproject(
+            &tmp,
+            "[tool.trustedlicenses]\nallowed-licenses = [\"MIT\"]\n",
+        );
+        assert_eq!(
+            load_policy_file(&path).expect("policy").allowed_licenses,
+            set(&["MIT"])
+        );
+        fs::write(&shared, "name = \"not a policy\"\n").expect("write");
+        assert!(load_policy_file(&shared)
+            .expect_err("error")
+            .message()
+            .contains("needs a non-empty allowed-categories"));
+    }
+
+    #[test]
+    fn trusted_indexes_are_urls_without_credentials_and_never_pypi() {
+        let policy = load(
+            "[tool.trustedlicenses]\nallowed-categories = [\"Permissive\"]\n\
+             trusted-indexes = [\"https://nexus.example.com/repository/pypi-internal/simple/\"]\n",
+        )
+        .expect("policy");
+        assert_eq!(
+            policy.trusted_indexes,
+            set(&["https://nexus.example.com/repository/pypi-internal/simple"])
+        );
+        for (entry, expected) in [
+            (
+                "https://user:secret@nexus.example.com/simple",
+                "carries credentials",
+            ),
+            ("https://pypi.org/simple", "anyone can publish there"),
+            ("nexus.example.com/simple", "isn't an http(s) URL"),
+        ] {
+            let error = load(&format!(
+                "[tool.trustedlicenses]\nallowed-categories = [\"Permissive\"]\ntrusted-indexes = [\"{entry}\"]\n"
+            ))
+            .expect_err("error");
+            assert!(error.message().contains(expected), "{}", error.message());
+            assert!(!error.message().contains("secret"), "{}", error.message());
+        }
+    }
+
+    #[test]
+    fn rewriting_replaces_the_setup_answers_and_keeps_package_decisions_if_asked() {
+        let tmp = tempdir().expect("tempdir");
+        let body = "[project]\nname = \"x\"\n\n[tool.trustedlicenses]\nuse-case = \"internal\"\n\
+                    # agreed with legal\nallowed-categories = [\"Permissive\", \"Copyleft Limited\"]\n\
+                    ignored-packages = [\"vendored\"] # reviewed\nallow-unlicensed = true\n\n\
+                    [tool.trustedlicenses.accepted-licenses]\ncertifi = [\"MPL-2.0\"]\n\n\
+                    [tool.ruff]\nline-length = 100\n";
+        let path = pyproject(&tmp, body);
+        let licenses = set(&["LGPL-3.0-only"]);
+        let new = NewPolicy {
+            allowed_categories: &strings(&["Permissive", "Copyleft Limited"]),
+            pinned_categories: &strings(&["Copyleft Limited"]),
+            pinned_licenses: &licenses,
+            allow_unlicensed: false,
+            trusted_indexes: &strings(&["https://nexus.example.com/simple"]),
+            ignored_packages: &[],
+            use_case: Some(UseCase::Product),
+        };
+        rewrite_policy(&path, &new, true).expect("rewrite");
+        let written = fs::read_to_string(&path).expect("read");
+        assert!(
+            written.contains(
+                "[tool.trustedlicenses]\nuse-case = \"product\"\n# agreed with legal\n\
+                 allowed-categories = [\"Permissive\"]\n"
+            ),
+            "{written}"
+        );
+        assert!(
+            written.contains("ignored-packages = [\"vendored\"] # reviewed"),
+            "{written}"
+        );
+        assert!(!written.contains("allow-unlicensed"), "{written}");
+        assert!(
+            written.contains("[tool.ruff]\nline-length = 100"),
+            "{written}"
+        );
+        let policy = load_policy(&path).expect("policy");
+        assert_eq!(policy.pinned_categories, set(&["Copyleft Limited"]));
+        assert_eq!(policy.allowed_licenses, licenses);
+        assert_eq!(
+            policy.trusted_indexes,
+            set(&["https://nexus.example.com/simple"])
+        );
+        assert_eq!(policy.ignored_packages, set(&["vendored"]));
+        assert!(policy.accepted_licenses.contains_key("certifi"));
+
+        rewrite_policy(&path, &new, false).expect("rewrite");
+        let policy = load_policy(&path).expect("policy");
+        assert!(policy.ignored_packages.is_empty());
+        assert!(policy.accepted_licenses.is_empty());
+        let written = fs::read_to_string(&path).expect("read");
+        assert!(!written.contains("accepted-licenses"), "{written}");
+        assert!(written.contains("[tool.ruff]"), "{written}");
+    }
+
+    #[test]
+    fn rewriting_with_the_same_answers_keeps_every_comment() {
+        let tmp = tempdir().expect("tempdir");
+        let body = "[tool.trustedlicenses]\n# chosen at setup\nuse-case = \"internal\"\n\
+                    # legal agreed 2026-01\nallowed-categories = [\"Permissive\"] # JIRA-1\n\
+                    allowed-licenses = [\n    \"MPL-2.0\", # certifi only\n    \"LicenseRef-acme\", # our own\n]\n\
+                    pinned-categories = [\"Copyleft Limited\"]\n\
+                    # approved by security, SEC-42\n\
+                    trusted-indexes = [\"https://nexus.example.com/simple\"]\n";
+        let path = pyproject(&tmp, body);
+        let licenses = set(&["LicenseRef-acme", "MPL-2.0"]);
+        let unchanged = NewPolicy {
+            allowed_categories: &strings(&["Permissive", "Copyleft Limited"]),
+            pinned_categories: &strings(&["Copyleft Limited"]),
+            pinned_licenses: &licenses,
+            allow_unlicensed: false,
+            trusted_indexes: &strings(&["https://nexus.example.com/simple"]),
+            ignored_packages: &[],
+            use_case: Some(UseCase::Internal),
+        };
+        rewrite_policy(&path, &unchanged, true).expect("rewrite");
+        assert_eq!(fs::read_to_string(&path).expect("read"), body);
+
+        // A license added later joins the list; the others keep their comments.
+        let more = set(&["LGPL-3.0-only", "LicenseRef-acme", "MPL-2.0"]);
+        rewrite_policy(
+            &path,
+            &NewPolicy {
+                pinned_licenses: &more,
+                ..unchanged
+            },
+            true,
+        )
+        .expect("rewrite");
+        let written = fs::read_to_string(&path).expect("read");
+        assert!(
+            written.contains(
+                "allowed-licenses = [\n    \"MPL-2.0\", # certifi only\n    \"LicenseRef-acme\", # our own\n    \"LGPL-3.0-only\",\n]"
+            ),
+            "{written}"
+        );
+    }
+
+    #[test]
+    fn pinning_one_category_keeps_each_remaining_categorys_own_comment() {
+        let tmp = tempdir().expect("tempdir");
+        let path = pyproject(
+            &tmp,
+            "[tool.trustedlicenses]\nallowed-categories = [\n    \"Permissive\", # most things\n    \
+             \"Copyleft Limited\", # LGPL ok per JIRA-2\n    \"Public Domain\",\n]\n",
+        );
+        pin_policy(&path, &set(&["Copyleft Limited"]), &set(&["MPL-2.0"])).expect("pin");
+        let written = fs::read_to_string(&path).expect("read");
+        assert!(
+            written.contains(
+                "allowed-categories = [\n    \"Permissive\", # most things\n    \"Public Domain\",\n]"
+            ),
+            "{written}"
+        );
+        assert!(!written.contains("JIRA-2"), "{written}");
+
+        let single = pyproject(
+            &tmp,
+            "[tool.trustedlicenses]\nallowed-categories = [\"Copyleft Limited\", \"Permissive\"]\n",
+        );
+        pin_policy(&single, &set(&["Copyleft Limited"]), &set(&["MPL-2.0"])).expect("pin");
+        assert!(fs::read_to_string(&single)
+            .expect("read")
+            .contains("allowed-categories = [\"Permissive\"]\n"));
     }
 }

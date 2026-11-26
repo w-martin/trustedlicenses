@@ -123,6 +123,8 @@ Before you publish or ship, `trustedlicenses pin` swaps `allowed-categories` for
 ([Pinning to specific licenses](usage.md#pinning-to-specific-licenses)). Nothing that passes
 now starts failing, but a license new to the project fails until someone accepts it,
 including one from the list below that shares a category with something you already allow.
+To tighten only the categories whose licenses differ most, such as Copyleft Limited, pin
+just those with `--category` ([Pinning one category](usage.md#pinning-one-category)).
 
 To show a reviewer what the policy accepts and why, run `trustedlicenses report`
 ([A report for review](usage.md#a-report-for-review)).

@@ -236,9 +236,11 @@ fn run_saves_the_use_case_and_keeps_categories_by_default() {
     assert!(text.contains("use-case = \"internal\""), "{text}");
     assert!(text.contains("allowed-categories"), "{text}");
     assert!(!text.contains("allowed-licenses"), "{text}");
-    assert!(io
-        .text()
-        .contains("These categories allow 1 license(s) in your environment now: MIT."));
+    assert!(
+        io.text().contains("  Permissive: MIT (1 package(s))"),
+        "{}",
+        io.text()
+    );
 }
 
 #[test]
@@ -248,17 +250,87 @@ fn run_pins_to_the_detected_licenses_when_asked() {
         licence("mitpkg", &["MIT"], &["Permissive"]),
         licence("gplpkg", &["GPL-3.0-only"], &["Copyleft"]),
     ];
-    // setup; Permissive, Public Domain, Copyleft Limited yes; Copyleft no; pin yes;
-    // standalone no; write yes.
+    // setup; Permissive, Public Domain, Copyleft Limited yes; Copyleft no; pin Permissive
+    // yes; standalone no; write yes.
     let mut io = Script::setting_up("p", &[true, true, true, true, false, true, false, true]);
     assert_eq!(
         setup(&mut io, &pyproject, &detected),
         Some(pyproject.clone())
     );
     let policy = load_policy(&pyproject).expect("policy");
-    assert!(policy.allowed_categories.is_empty());
+    assert_eq!(
+        policy.allowed_categories,
+        set(&["Public Domain", "Copyleft Limited"])
+    );
     assert_eq!(policy.allowed_licenses, set(&["MIT"]));
+    assert_eq!(policy.pinned_categories, set(&["Permissive"]));
     assert_eq!(policy.use_case, Some(UseCase::Product));
+}
+
+#[test]
+fn run_offers_to_pin_each_category_in_use_and_suggests_copyleft_limited() {
+    let (_tmp, pyproject) = project(BARE);
+    let detected = [
+        licence("mitpkg", &["MIT"], &["Permissive"]),
+        licence("certifi", &["MPL-2.0"], &["Copyleft Limited"]),
+        licence("chardet", &["LGPL-2.1-or-later"], &["Copyleft Limited"]),
+    ];
+    // Setup, then every default: Permissive, Public Domain and Copyleft Limited allowed,
+    // Copyleft not; Permissive left whole, Copyleft Limited pinned.
+    let mut io = Script::setting_up("i", &[true]);
+    assert_eq!(
+        setup(&mut io, &pyproject, &detected),
+        Some(pyproject.clone())
+    );
+    let text = io.text();
+    assert!(text.contains("  Permissive: MIT (1 package(s))"), "{text}");
+    assert!(
+        text.contains("  Copyleft Limited: LGPL-2.1-or-later, MPL-2.0 (2 package(s))"),
+        "{text}"
+    );
+    // Public Domain has nothing in use, so pinning it isn't offered.
+    assert!(!text.contains("Pin Public Domain?"), "{text}");
+    let policy = load_policy(&pyproject).expect("policy");
+    assert_eq!(
+        policy.allowed_categories,
+        set(&["Permissive", "Public Domain"])
+    );
+    assert_eq!(
+        policy.allowed_licenses,
+        set(&["LGPL-2.1-or-later", "MPL-2.0"])
+    );
+    assert_eq!(policy.pinned_categories, set(&["Copyleft Limited"]));
+    assert!(trustedlicenses_core::policy::reevaluate(&detected, &policy).passed());
+}
+
+#[test]
+fn run_asks_about_unlicensed_packages_and_defaults_to_no() {
+    let (_tmp, pyproject) = project(BARE);
+    let detected = [licence("mitpkg", &["MIT"], &["Permissive"]), failure("dbt")];
+    let mut io = Script::setting_up("i", &[true]);
+    setup(&mut io, &pyproject, &detected);
+    let text = io.text();
+    assert!(text.contains("No license at all: dbt."), "{text}");
+    assert!(text.contains("Allow packages with no license?"), "{text}");
+    assert!(!load_policy(&pyproject).expect("policy").allow_unlicensed);
+
+    let (_tmp, pyproject) = project(BARE);
+    // Setup; the four categories; pin Permissive no; allow unlicensed yes.
+    let mut io = Script::setting_up("i", &[true, true, true, true, false, false, true]);
+    setup(&mut io, &pyproject, &detected);
+    assert!(load_policy(&pyproject).expect("policy").allow_unlicensed);
+}
+
+#[test]
+fn run_does_not_ask_about_unlicensed_packages_when_there_are_none() {
+    let (_tmp, pyproject) = project(BARE);
+    let mut io = Script::setting_up("i", &[true]);
+    setup(
+        &mut io,
+        &pyproject,
+        &[licence("mitpkg", &["MIT"], &["Permissive"])],
+    );
+    assert!(!io.text().contains("Allow packages with no license?"));
 }
 
 #[test]
@@ -266,7 +338,7 @@ fn run_does_not_offer_to_pin_when_nothing_would_be_pinned() {
     let (_tmp, pyproject) = project(BARE);
     let mut io = Script::setting_up("o", &[true]);
     setup(&mut io, &pyproject, &[]);
-    assert!(!io.text().contains("Pin to these licenses"));
+    assert!(!io.text().contains("Pinning a category"));
 }
 
 #[test]
@@ -443,6 +515,7 @@ fn review(
         compatibility_notes: Vec::new(),
         exceptions: Vec::new(),
         pinned: false,
+        pinned_categories: BTreeSet::new(),
     };
     let env = HashMap::new();
     let services = Services {
@@ -754,6 +827,7 @@ fn review_aborts_gracefully_when_a_prompt_is_never_answered() {
         compatibility_notes: Vec::new(),
         exceptions: Vec::new(),
         pinned: false,
+        pinned_categories: BTreeSet::new(),
     };
     let index = FakeIndex::default();
     let env = HashMap::new();
@@ -1056,4 +1130,309 @@ fn review_unlicensed_is_not_offered_for_a_free_text_statement() {
     let wordy = suggesting("wordy", "Apache License, Version 2.0", "Apache-2.0");
     assert!(!reviewed(&mut io, &pyproject, vec![wordy]));
     assert!(!load_policy(&pyproject).expect("policy").allow_unlicensed);
+}
+
+const NEXUS: &str = "https://nexus.example.com/repository/pypi-internal/simple";
+
+fn from_index(mut result: DistributionLicence, index: &str) -> DistributionLicence {
+    result.index = Some(index.to_owned());
+    result
+}
+
+#[test]
+fn run_offers_to_trust_an_internal_index_serving_unlicensed_packages() {
+    let (_tmp, pyproject) = project(BARE);
+    let detected = [
+        from_index(
+            licence("requests", &["Apache-2.0"], &["Permissive"]),
+            "https://pypi.org/simple",
+        ),
+        from_index(failure("acme-core"), NEXUS),
+        from_index(failure("acme-etl"), NEXUS),
+        from_index(failure("stray"), "https://pypi.org/simple"),
+    ];
+    let mut io = Script::setting_up("i", &[true]);
+    setup(&mut io, &pyproject, &detected);
+    let text = io.text();
+    assert!(
+        text.contains(&format!(
+            "No identifiable license, from {NEXUS}: acme-core, acme-etl."
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains("If this is your own internal index"),
+        "{text}"
+    );
+    // PyPI is never offered; its unlicensed package goes to the allow-unlicensed question.
+    assert!(!text.contains("from https://pypi.org/simple?"), "{text}");
+    assert!(text.contains("No license at all: stray."), "{text}");
+    let policy = load_policy(&pyproject).expect("policy");
+    assert_eq!(policy.trusted_indexes, set(&[NEXUS]));
+    assert!(!policy.allow_unlicensed);
+    assert!(trustedlicenses_core::policy::reevaluate(&detected[..3], &policy).passed());
+}
+
+#[test]
+fn run_warns_that_an_index_serving_licensed_packages_may_be_a_proxy() {
+    let (_tmp, pyproject) = project(BARE);
+    let detected = [
+        from_index(licence("requests", &["Apache-2.0"], &["Permissive"]), NEXUS),
+        from_index(failure("acme-core"), NEXUS),
+    ];
+    let mut io = Script::setting_up("i", &[true]);
+    setup(&mut io, &pyproject, &detected);
+    let text = io.text();
+    assert!(text.contains("so it may proxy PyPI"), "{text}");
+    // Defaults to not trusting it.
+    assert!(load_policy(&pyproject)
+        .expect("policy")
+        .trusted_indexes
+        .is_empty());
+}
+
+#[test]
+fn review_can_trust_the_index_a_failure_came_from_and_skips_the_rest_from_it() {
+    let (_tmp, pyproject) = project(POLICY_FILE);
+    let mut io = Script::choosing(&[true, true], &["o"]);
+    assert!(reviewed(
+        &mut io,
+        &pyproject,
+        vec![
+            from_index(failure("acme-core"), NEXUS),
+            from_index(failure("acme-etl"), NEXUS)
+        ],
+    ));
+    let text = io.text();
+    assert!(
+        text.contains(&format!(
+            "[o]ur index: pass every package with no identified license from {NEXUS}"
+        )),
+        "{text}"
+    );
+    assert_eq!(
+        text.matches("acme-etl: no license detected").count(),
+        0,
+        "{text}"
+    );
+    assert_eq!(
+        load_policy(&pyproject).expect("policy").trusted_indexes,
+        set(&[NEXUS])
+    );
+}
+
+#[test]
+fn review_doesnt_offer_to_trust_pypi() {
+    let (_tmp, pyproject) = project(POLICY_FILE);
+    let mut io = Script::choosing(&[true], &["s"]);
+    reviewed(
+        &mut io,
+        &pyproject,
+        vec![from_index(failure("stray"), "https://pypi.org/simple")],
+    );
+    assert!(!io.text().contains("[o]ur index"), "{}", io.text());
+}
+
+const CONFIGURED: &str =
+    "[project]\nname = 'x'\n\n[tool.trustedlicenses]\nuse-case = \"internal\"\n\
+    allowed-categories = [\"Permissive\", \"Public Domain\"]\n\
+    allowed-licenses = [\"MPL-2.0\", \"LicenseRef-acme\"]\n\
+    pinned-categories = [\"Copyleft Limited\"]\n\
+    trusted-indexes = [\"https://nexus.example.com/repository/pypi-internal/simple\"]\n\n\
+    [tool.trustedlicenses.accepted-licenses]\nchardet = [\"LGPL-2.1-or-later\"]\n";
+
+fn configured_detections() -> Vec<DistributionLicence> {
+    vec![
+        licence("requests", &["MIT"], &["Permissive"]),
+        licence("certifi", &["MPL-2.0"], &["Copyleft Limited"]),
+        licence("chardet", &["LGPL-2.1-or-later"], &["Copyleft Limited"]),
+        from_index(failure("acme-core"), NEXUS),
+    ]
+}
+
+fn rerun(io: &mut Script, pyproject: &Path, detected: &[DistributionLicence]) -> Option<PathBuf> {
+    let prior = load_policy(pyproject).expect("policy");
+    wizard()
+        .setup(io, pyproject, detected, Some(&prior))
+        .expect("no abort")
+}
+
+#[test]
+fn rerunning_setup_and_pressing_enter_throughout_keeps_the_policy() {
+    let (_tmp, pyproject) = project(CONFIGURED);
+    let before = load_policy(&pyproject).expect("policy");
+    let mut io = Script::choosing(&[], &[]);
+    assert_eq!(
+        rerun(&mut io, &pyproject, &configured_detections()),
+        Some(pyproject.clone())
+    );
+    let text = io.text();
+    assert!(!text.contains("No policy configured yet"), "{text}");
+    assert!(text.contains("Each answer defaults to what"), "{text}");
+    assert!(text.contains("chardet"), "{text}");
+    let after = load_policy(&pyproject).expect("policy");
+    assert_eq!(after.use_case, before.use_case);
+    assert_eq!(after.allowed_categories, before.allowed_categories);
+    assert_eq!(after.pinned_categories, before.pinned_categories);
+    assert_eq!(after.allowed_licenses, before.allowed_licenses);
+    assert_eq!(after.trusted_indexes, before.trusted_indexes);
+    assert_eq!(after.accepted_licenses, before.accepted_licenses);
+}
+
+#[test]
+fn rerunning_setup_can_drop_the_package_by_package_decisions() {
+    let (_tmp, pyproject) = project(CONFIGURED);
+    // Categories and pins as they are; trust the index; drop package decisions; rewrite.
+    let mut io = Script::choosing(
+        &[true, true, true, false, false, true, true, false, true],
+        &[],
+    );
+    rerun(&mut io, &pyproject, &configured_detections());
+    let after = load_policy(&pyproject).expect("policy");
+    assert!(after.accepted_licenses.is_empty());
+    assert_eq!(after.pinned_categories, set(&["Copyleft Limited"]));
+    // chardet's license was accepted for chardet alone; dropping that doesn't widen the pin.
+    assert_eq!(after.allowed_licenses, set(&["LicenseRef-acme", "MPL-2.0"]));
+}
+
+#[test]
+fn rerunning_setup_keeps_a_pinned_category_nothing_uses_pinned() {
+    let (_tmp, pyproject) = project(CONFIGURED);
+    let mut io = Script::choosing(&[], &[]);
+    rerun(
+        &mut io,
+        &pyproject,
+        &[licence("requests", &["MIT"], &["Permissive"])],
+    );
+    assert!(
+        io.text()
+            .contains("  Copyleft Limited: pinned now, to MPL-2.0"),
+        "{}",
+        io.text()
+    );
+    let after = load_policy(&pyproject).expect("policy");
+    assert_eq!(after.pinned_categories, set(&["Copyleft Limited"]));
+    assert!(!after.allowed_categories.contains("Copyleft Limited"));
+    assert_eq!(after.allowed_licenses, set(&["LicenseRef-acme", "MPL-2.0"]));
+}
+
+#[test]
+fn rerunning_setup_and_unpinning_a_category_says_which_licenses_go() {
+    let (_tmp, pyproject) = project(CONFIGURED);
+    // Permissive, Public Domain, Copyleft Limited allowed, Copyleft not; Permissive and
+    // Copyleft Limited left unpinned.
+    let mut io = Script::choosing(&[true, true, true, false, false, false], &[]);
+    rerun(&mut io, &pyproject, &configured_detections());
+    assert!(
+        io.text().contains(
+            "No longer listed in allowed-licenses, as your answers above decide them: MPL-2.0."
+        ),
+        "{}",
+        io.text()
+    );
+    let after = load_policy(&pyproject).expect("policy");
+    assert!(after.allowed_categories.contains("Copyleft Limited"));
+    assert!(after.pinned_categories.is_empty());
+    assert_eq!(after.allowed_licenses, set(&["LicenseRef-acme"]));
+}
+
+fn reevaluated(pyproject: &Path, detected: &[DistributionLicence]) -> PolicyResult {
+    trustedlicenses_core::policy::reevaluate(detected, &load_policy(pyproject).expect("policy"))
+}
+
+const PINNED_BY_V050: &str =
+    "[project]\nname = 'x'\n\n[tool.trustedlicenses]\nuse-case = \"internal\"\n\
+    allowed-licenses = [\n    \"MIT\",\n    \"MPL-2.0\",\n]\n";
+
+fn mit_and_mpl() -> Vec<DistributionLicence> {
+    vec![
+        licence("requests", &["MIT"], &["Permissive"]),
+        licence("certifi", &["MPL-2.0"], &["Copyleft Limited"]),
+    ]
+}
+
+#[test]
+fn rerunning_setup_over_a_policy_pinned_before_pinned_categories_keeps_it_pinned() {
+    let newcomer = [licence("newpkg", &["BSD-2-Clause"], &["Permissive"])];
+    for confirms in [&[][..], &[true][..]] {
+        let (_tmp, pyproject) = project(PINNED_BY_V050);
+        let mut io = Script::choosing(confirms, &[]);
+        assert_eq!(
+            rerun(&mut io, &pyproject, &mit_and_mpl()),
+            Some(pyproject.clone()),
+            "{}",
+            io.text()
+        );
+        let after = load_policy(&pyproject).expect("policy");
+        assert!(after.allowed_categories.is_empty(), "{after:?}");
+        assert_eq!(after.allowed_licenses, set(&["MIT", "MPL-2.0"]));
+        assert_eq!(
+            after.pinned_categories,
+            set(&["Copyleft Limited", "Permissive"])
+        );
+        assert!(reevaluated(&pyproject, &mit_and_mpl()).passed());
+        assert!(!reevaluated(&pyproject, &newcomer).passed());
+    }
+}
+
+#[test]
+fn rerunning_setup_keeps_licenses_listed_by_hand_alongside_categories() {
+    let (_tmp, pyproject) = project(
+        "[tool.trustedlicenses]\nuse-case = \"internal\"\nallowed-categories = [\"Permissive\"]\n\
+         allowed-licenses = [\"MPL-2.0\", \"GPL-3.0-only\", \"MIT\"]\n",
+    );
+    let detected = [
+        licence("requests", &["MIT"], &["Permissive"]),
+        licence("certifi", &["MPL-2.0"], &["Copyleft Limited"]),
+        licence("gplpkg", &["GPL-3.0-only"], &["Copyleft"]),
+    ];
+    let before = load_policy(&pyproject).expect("policy");
+    let mut io = Script::choosing(&[], &[]);
+    rerun(&mut io, &pyproject, &detected);
+    let after = load_policy(&pyproject).expect("policy");
+    assert_eq!(after.allowed_categories, before.allowed_categories);
+    assert_eq!(after.allowed_licenses, before.allowed_licenses);
+    assert!(!io.text().contains("No longer listed"), "{}", io.text());
+    assert!(reevaluated(&pyproject, &detected).passed());
+}
+
+#[test]
+fn pinning_in_setup_counts_licenses_that_pass_through_a_trusted_correction() {
+    let (_tmp, pyproject) = project(
+        "[tool.trustedlicenses]\nuse-case = \"internal\"\nallowed-categories = [\"Permissive\"]\n\
+         trust-corrected-licenses = true\n",
+    );
+    let corrected = DistributionLicence {
+        name: "foo".to_owned(),
+        suggested: BTreeSet::from([("Apache License 2.0".to_owned(), "Apache-2.0".to_owned())]),
+        declares_license: true,
+        source: "x".to_owned(),
+        ..DistributionLicence::default()
+    };
+    let detected = [licence("requests", &["MIT"], &["Permissive"]), corrected];
+    assert!(reevaluated(&pyproject, &detected).passed());
+    // Permissive yes; Public Domain, Copyleft Limited, Copyleft no; pin Permissive.
+    let mut io = Script::choosing(&[true, false, false, false, true], &[]);
+    rerun(&mut io, &pyproject, &detected);
+    let after = load_policy(&pyproject).expect("policy");
+    assert_eq!(after.allowed_licenses, set(&["Apache-2.0", "MIT"]));
+    assert!(reevaluated(&pyproject, &detected).passed());
+}
+
+#[test]
+fn rerunning_setup_can_leave_an_unrecorded_use_case_unrecorded() {
+    let (_tmp, pyproject) =
+        project("[tool.trustedlicenses]\nallowed-categories = [\"Permissive\"]\n");
+    let mut io = Script::choosing(&[], &[]);
+    rerun(
+        &mut io,
+        &pyproject,
+        &[licence("requests", &["MIT"], &["Permissive"])],
+    );
+    assert!(
+        io.text().contains("press Enter to leave it that way"),
+        "{}",
+        io.text()
+    );
+    assert_eq!(load_policy(&pyproject).expect("policy").use_case, None);
 }

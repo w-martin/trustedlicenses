@@ -857,9 +857,27 @@ fn safe_component(text: &str) -> String {
 fn cache_entry(options: &FetchOptions<'_>, index_url: &str, name: &str, version: &str) -> PathBuf {
     options
         .cache_dir
+        .join(format!("v{CACHE_FORMAT}"))
         .join(format!("{:016x}", fnv1a(&redact_url(index_url))))
         .join(safe_component(name))
         .join(safe_component(version))
+}
+
+/// Part of each entry's path, so an entry an older layout wrote is never read, nor replaced in
+/// place where another process might be reading it.
+const CACHE_FORMAT: &str = "2";
+
+/// Beside a cached `METADATA`: the in-tree build backend of the sdist it was read from.
+const IN_TREE_BACKEND_FILE: &str = "in-tree-build-backend";
+
+/// The in-tree build backend of the sdist a fetched distribution was read from, if any: what
+/// installs is whatever that backend produces, which may not be what was read.
+#[must_use]
+pub fn in_tree_backend(distribution: &Distribution) -> Option<String> {
+    let path = distribution.dist_info.as_ref()?.join(IN_TREE_BACKEND_FILE);
+    fs::read_to_string(path)
+        .ok()
+        .map(|text| text.trim().to_owned())
 }
 
 fn load_cached(entry: &Path, name: &str, version: &str) -> Option<Distribution> {
@@ -1006,6 +1024,9 @@ fn fill_from_sdist(
     let contents = sdist::read_sdist(&body, &sdist.filename)
         .map_err(|error| FetchError(format!("{}: {error}", sdist.filename)))?;
     fs::write(dist_info.join("METADATA"), contents.pkg_info).map_err(io_error)?;
+    if let Some(backend) = &contents.in_tree_backend {
+        fs::write(dist_info.join(IN_TREE_BACKEND_FILE), backend).map_err(io_error)?;
+    }
     for (relative, bytes) in contents.licences {
         let target = dist_info
             .join("licenses")
